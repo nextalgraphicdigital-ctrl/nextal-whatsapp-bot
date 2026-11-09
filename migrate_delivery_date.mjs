@@ -1,0 +1,1 @@
+﻿import { query } from './config/db.js'; try { await query('ALTER TABLE orders ADD COLUMN IF NOT EXISTS fecha_entrega_estimada DATE'); console.log('OK: columna agregada'); } catch(e) { console.log('Note:', e.message); } process.exit(0);

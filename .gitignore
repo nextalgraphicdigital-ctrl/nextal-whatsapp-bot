@@ -1,0 +1,7 @@
+node_modules/
+.env
+logs/
+baileys_auth_info/
+baileys_auth_info_backup_*/
+temp_audio_*.ogg
+*.log
