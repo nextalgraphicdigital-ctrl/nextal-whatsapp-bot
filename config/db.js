@@ -7,8 +7,15 @@ const { Pool } = pkg;
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: path.join(__dirname, '../.env') });
 
+// pg interpreta sslmode incluido en la URL y puede sobrescribir la opción ssl
+// definida abajo. En Node reciente eso termina rechazando algunas cadenas de
+// certificados de Neon aunque rejectUnauthorized esté configurado como false.
+const databaseUrl = process.env.DATABASE_URL
+  ?.replace(/([?&])sslmode=[^&]*&?/i, (_, separator) => (separator === '?' ? '?' : ''))
+  ?.replace(/[?&]$/, '');
+
 export const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
+  connectionString: databaseUrl,
   ssl: {
     rejectUnauthorized: false
   },
