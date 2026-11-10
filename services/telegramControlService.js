@@ -1,5 +1,5 @@
 import { query } from '../config/db.js';
-import { sendWhatsAppWithDelay } from './baileysService.js';
+import { sendWhatsAppWithDelay } from './whatsappTransport.js';
 
 let updateOffset = 0;
 let pollTimer = null;

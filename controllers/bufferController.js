@@ -5,7 +5,7 @@ import { query } from '../config/db.js';
 import { transcribeAudio } from '../services/whisperService.js';
 import { extractOrderDetails, validatePaymentReceipt, detectFeedbackOrAdjustment, assignDesignAssetsToProducts } from '../services/geminiService.js';
 import { createOrderFolder, getFolderIdFromUrl, uploadBase64ToFolder, getFinalDeliverables } from '../services/driveService.js';
-import { sendWhatsAppWithDelay } from '../services/baileysService.js';
+import { sendWhatsAppWithDelay } from '../services/whatsappTransport.js';
 import { getActiveBotRulesContext, notifyNewOrderBatch } from '../services/telegramControlService.js';
 
 const __filename = fileURLToPath(import.meta.url);

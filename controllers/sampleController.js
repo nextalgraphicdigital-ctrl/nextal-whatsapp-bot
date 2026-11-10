@@ -1,4 +1,4 @@
-import { sendWhatsappWithDelay } from '../services/baileysService.js';
+import { sendWhatsappWithDelay } from '../services/whatsappTransport.js';
 import { query } from '../config/db.js';
 
 // Evita dobles clics y peticiones simultáneas para un mismo pedido.

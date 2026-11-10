@@ -29,11 +29,15 @@ import apiRoutes from './routes/apiRoutes.js';
 import { initBaileys } from './services/baileysService.js';
 import { processInboundBuffers } from './controllers/bufferController.js';
 import { startTelegramControl } from './services/telegramControlService.js';
+import { verifyCloudWebhook, receiveCloudWebhook } from './controllers/cloudWebhookController.js';
 
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+// Conserva el modo anterior si una instalación todavía no configuró Cloud API.
+// Las instalaciones nuevas deben usar WHATSAPP_TRANSPORT=cloud en su .env.
+const usingCloudApi = String(process.env.WHATSAPP_TRANSPORT || 'baileys').toLowerCase() === 'cloud';
 
 // Middlewares
 app.use(cors());
@@ -41,14 +45,21 @@ app.use(express.json());
 
 // Rutas API
 app.use('/api', apiRoutes);
+app.get('/webhooks/whatsapp', verifyCloudWebhook);
+app.post('/webhooks/whatsapp', receiveCloudWebhook);
 
 // Iniciar Servidor HTTP
 const httpServer = app.listen(PORT, async () => {
   console.log(`🚀 Microservicio WhatsApp escuchando en el puerto ${PORT}`);
 
-  // Iniciar servicio Baileys (WhatsApp Web Socket)
+  // Cloud API recibe mensajes por webhook. Baileys solo se conserva como
+  // alternativa local temporal y no debe iniciarse en modo oficial.
   try {
-    await initBaileys();
+    if (usingCloudApi) {
+      console.log('☁️ WhatsApp Cloud API activa. Esperando mensajes en /webhooks/whatsapp');
+    } else {
+      await initBaileys();
+    }
     await startTelegramControl();
 
     console.log('🔄 Iniciando motor de Debounce / Búfer (Evaluación cada 3 segundos)...');
@@ -57,7 +68,7 @@ const httpServer = app.listen(PORT, async () => {
     }, 3000);
 
   } catch (error) {
-    console.error('❌ Error al iniciar Baileys Service:', error.message);
+    console.error('❌ Error al iniciar el transporte de WhatsApp:', error.message);
   }
 });
 
