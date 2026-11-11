@@ -1,4 +1,5 @@
 import { query } from '../config/db.js';
+import crypto from 'crypto';
 import { downloadCloudMedia } from '../services/whatsappCloudService.js';
 
 const verifyToken = () => String(process.env.WHATSAPP_WEBHOOK_VERIFY_TOKEN || '').trim();
@@ -9,6 +10,17 @@ export function verifyCloudWebhook(req, res) {
   const challenge = req.query['hub.challenge'];
   if (mode === 'subscribe' && verifyToken() && token === verifyToken()) return res.status(200).send(challenge);
   return res.sendStatus(403);
+}
+
+function hasValidMetaSignature(req) {
+  const appSecret = String(process.env.WHATSAPP_APP_SECRET || '').trim();
+  // Mientras se prueba con el número de prueba, la firma es opcional. En
+  // producción se activa al añadir el App Secret al .env.
+  if (!appSecret) return true;
+  const provided = String(req.get('x-hub-signature-256') || '');
+  const expected = `sha256=${crypto.createHmac('sha256', appSecret).update(req.rawBody || '').digest('hex')}`;
+  if (provided.length !== expected.length) return false;
+  return crypto.timingSafeEqual(Buffer.from(provided), Buffer.from(expected));
 }
 
 function messageContent(message) {
@@ -42,6 +54,10 @@ async function storeInboundMessage(message) {
 }
 
 export async function receiveCloudWebhook(req, res) {
+  if (!hasValidMetaSignature(req)) {
+    console.warn('⚠️ [Cloud API] Webhook rechazado: firma de Meta inválida.');
+    return res.sendStatus(401);
+  }
   res.sendStatus(200);
   try {
     for (const entry of req.body?.entry || []) {

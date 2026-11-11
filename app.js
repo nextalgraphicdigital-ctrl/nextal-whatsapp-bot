@@ -41,7 +41,9 @@ const usingCloudApi = String(process.env.WHATSAPP_TRANSPORT || 'baileys').toLowe
 
 // Middlewares
 app.use(cors());
-app.use(express.json());
+// Conserva el cuerpo exacto para validar la firma de Meta cuando se configure
+// WHATSAPP_APP_SECRET. Las demás rutas siguen recibiendo JSON normalmente.
+app.use(express.json({ verify: (req, _res, buffer) => { req.rawBody = buffer; } }));
 
 // Rutas API
 app.use('/api', apiRoutes);
