@@ -136,11 +136,12 @@ REGLAS CONVERSACIONALES:
      * "needsClarification": false
      * Extrae los productos para preparar una cotización. Mencionar un producto, solicitar precios o explicar un trabajo NO es confirmación de pedido. El sistema externo solo registra cuando el cliente escribe una aceptación explícita como “Confirmo el pedido”, “Sí lo quiero” o “Hagámoslo”.
      * NO hagas preguntas innecesarias sobre técnicas de impresión ni materiales. Mapea la solicitud directamente al servicio de diseño gráfico correspondiente (ej: ventana -> "Adhesivo", $15.000 COP).
-     * Si pide 1, 2 o más diseños distintos en la misma conversación, extrae CADA uno como un objeto en "productos".
+* Si pide 1, 2 o más diseños distintos que necesita juntos, extrae CADA uno como un objeto en "productos".
+* Si el cliente está comparando opciones mutuamente excluyentes (por ejemplo, "1x0, 2x0 o 4x0", "A/B/C", "opción X o Y"), incluye cada alternativa como producto, coloca "sonAlternativas": true y "montoTotalCalculado": 0. No sumes alternativas: cada precio corresponde a una opción individual y la aplicación solicitará elegir A/B/C.
      * En "medidas": extrae de forma limpia y puntual las dimensiones solicitadas (ej: "172 cm ancho x 191 cm alto", "2 x 1 m", "9 x 5 cm"). Si no indicó medidas o no aplica, coloca "No especificadas".
      * En "notasDiseno": redacta un resumen claro, limpio y conciso de los requerimientos y especificaciones del diseño indicados por el cliente (ej: "Diseño para vitrina de local comercial. Incluir logo de la empresa y lista de servicios publicitarios."). NUNCA incluyas saludos ni el texto completo del chat.
      * En "descripcionDetallada": redacta un resumen técnico completo y minucioso de lo que el cliente indicó para ese diseño (medidas de maquetación digital como 172 cm ancho x 191 cm alto, fotos de referencia, código de barras, insumos enviados al correo, etc.).
-     * "montoTotalCalculado": suma exacta de los productos extraídos según el catálogo oficial.
+* "montoTotalCalculado": suma exacta únicamente de productos que el cliente quiere juntos. Si "sonAlternativas": true, usa 0.
 
 3. FLUJO DE CLARIFICACIÓN (SOLO CUANDO NO SE TIENE NINGUNA IDEA DE QUÉ SERVICIO REQUIERE):
    - Si el cliente envía una consulta completamente ambigua sin especificar trabajo ni mandar medidas (ej: "hola, cuánto cobran por un trabajo?", "¿qué servicios tienen?"):
@@ -157,6 +158,7 @@ REGLAS CONVERSACIONALES:
   "nombreCliente": "string",
   "razonSocial": "string",
   "needsClarification": false,
+  "sonAlternativas": false,
   "productos": [
     {
       "tipoDiseno": "string",

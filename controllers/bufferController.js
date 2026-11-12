@@ -11,6 +11,8 @@ import { getActiveBotRulesContext, notifyNewOrderBatch } from '../services/teleg
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const POLICY_IMAGE_PATH = path.join(__dirname, '../assets/politicas-servicio.jpg');
+const QUOTE_SESSION_TTL_MS = 45 * 60 * 1000;
+const quoteSessions = new Map();
 
 // Ventana de silencio para debouncing (10 segundos de inactividad agrupan ráfagas de mensajes)
 const DEBOUNCE_SECONDS = 10;
@@ -353,7 +355,7 @@ function isExplicitOrderConfirmation(text) {
     .replace(/\s+/g, ' ')
     .trim();
 
-  if (!clean || /\b(no|todavia no|despues|solo|precio|precios|cotiz|informacion)\b/.test(clean)) return false;
+  if (!clean || /\b(no|todavia no|despues|solo|precio|precios|informacion)\b/.test(clean)) return false;
 
   return [
     'confirmo el pedido',
@@ -371,13 +373,116 @@ function isExplicitOrderConfirmation(text) {
   ].some(phrase => clean.includes(phrase));
 }
 
+function normalizeFlowText(text) {
+  return String(text || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[¿?¡!.,;:\-_/\\\n\r\t]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function getQuoteSessionKeys(phone) {
+  const raw = String(phone || '').trim();
+  const digits = raw.replace(/@.*$/, '').replace(/\D/g, '');
+  return [...new Set([raw, digits].filter(Boolean))];
+}
+
+function cloneQuoteData(data) {
+  return JSON.parse(JSON.stringify(data || {}));
+}
+
+function quoteProducts(data) {
+  return Array.isArray(data?.productos) ? data.productos.filter(Boolean) : [];
+}
+
+function isAlternativeQuote(data) {
+  return String(data?.sonAlternativas).toLowerCase() === 'true' && quoteProducts(data).length > 1;
+}
+
+function optionLabel(index) {
+  return String.fromCharCode(65 + index);
+}
+
+function formatQuoteProductName(product) {
+  const name = product?.tipoDiseno || 'Diseño gráfico';
+  const ink = product?.varianteTinta && product.varianteTinta !== 'No aplica'
+    ? ` (${product.varianteTinta})`
+    : '';
+  const detail = product?.descripcion ? ` — ${product.descripcion}` : '';
+  return `${name}${ink}${detail}`;
+}
+
+function getQuoteSession(phone) {
+  const keys = getQuoteSessionKeys(phone);
+  const session = keys.map(key => quoteSessions.get(key)).find(Boolean);
+  if (!session) return null;
+
+  if (Date.now() - session.updatedAt > QUOTE_SESSION_TTL_MS) {
+    keys.forEach(key => quoteSessions.delete(key));
+    return null;
+  }
+  return session;
+}
+
+function saveQuoteSession(phone, data) {
+  const session = {
+    data: cloneQuoteData(data),
+    selectedOptionIndex: null,
+    updatedAt: Date.now()
+  };
+  getQuoteSessionKeys(phone).forEach(key => quoteSessions.set(key, session));
+  return session;
+}
+
+function clearQuoteSession(phone) {
+  getQuoteSessionKeys(phone).forEach(key => quoteSessions.delete(key));
+}
+
+function findSelectedOptionIndex(text, optionCount) {
+  const clean = normalizeFlowText(text);
+  for (let index = 0; index < optionCount; index += 1) {
+    const letter = String.fromCharCode(97 + index);
+    const number = String(index + 1);
+    const pattern = new RegExp(`(^|\\s)(?:opcion\\s+)?(?:${letter}|${number})(?=\\s|$)`);
+    if (pattern.test(clean)) return index;
+  }
+  return null;
+}
+
+function selectedQuoteData(session) {
+  const data = cloneQuoteData(session?.data);
+  if (isAlternativeQuote(data) && Number.isInteger(session?.selectedOptionIndex)) {
+    const selected = quoteProducts(data)[session.selectedOptionIndex];
+    data.productos = [selected];
+    data.montoTotalCalculado = Number(selected?.precioUnitario || 0);
+    data.sonAlternativas = false;
+  }
+  return data;
+}
+
 /** Envía precio informativo, sin crear pedido, factura, carpeta ni cobro. */
 async function sendQuoteOnly(phone, parsedData) {
-  const products = Array.isArray(parsedData?.productos) ? parsedData.productos : [];
+  const products = quoteProducts(parsedData);
+
+  if (isAlternativeQuote(parsedData)) {
+    const options = products.map((product, index) => {
+      const price = Number(product?.precioUnitario || 0).toLocaleString('es-CO');
+      return `*${optionLabel(index)}.* *${formatQuoteProductName(product)}:* $${price} COP`;
+    }).join('\n');
+    const labels = products.map((_, index) => optionLabel(index)).join(', ');
+
+    await sendWhatsAppWithDelay(
+      phone,
+      `💬 *Opciones de cotización*\n\n${options}\n\n⚠️ Son alternativas: eliges una, por eso no se suman entre sí.\n\nResponde con *${labels}* para elegir la opción que necesitas. Después te pediremos confirmar el pedido.`
+    );
+    return;
+  }
+
   const items = products.map(product => {
-    const name = `${product.tipoDiseno || 'Diseño gráfico'}${product.varianteTinta && product.varianteTinta !== 'No aplica' ? ` (${product.varianteTinta})` : ''}`;
     const price = Number(product.precioUnitario || 0).toLocaleString('es-CO');
-    return `• *${name}:* $${price} COP`;
+    return `• *${formatQuoteProductName(product)}:* $${price} COP`;
   }).join('\n');
   const total = Number(parsedData?.montoTotalCalculado || 0).toLocaleString('es-CO');
 
@@ -385,6 +490,29 @@ async function sendQuoteOnly(phone, parsedData) {
     phone,
     `💬 *Cotización informativa*\n\n${items}\n\n💰 *Total estimado:* $${total} COP\n\n` +
     `Esta cotización no crea ningún pedido ni genera cobro. Si deseas avanzar, responde exactamente: *Confirmo el pedido*. ✅`
+  );
+}
+
+async function sendSelectedAlternativePrompt(phone, product, index) {
+  const price = Number(product?.precioUnitario || 0).toLocaleString('es-CO');
+  await sendWhatsAppWithDelay(
+    phone,
+    `✅ Elegiste la opción *${optionLabel(index)}*: *${formatQuoteProductName(product)}* por *$${price} COP*.\n\nEsta cotización aún no crea pedido ni genera cobro. Si quieres continuar, responde exactamente: *Confirmo el pedido*.`
+  );
+}
+
+async function sendAlternativeSelectionReminder(phone, count) {
+  const labels = Array.from({ length: count }, (_, index) => optionLabel(index)).join(', ');
+  await sendWhatsAppWithDelay(
+    phone,
+    `Antes de confirmar, elige una sola opción respondiendo *${labels}*. Así registraremos exactamente el producto que necesitas.`
+  );
+}
+
+async function sendFreshQuoteReminder(phone) {
+  await sendWhatsAppWithDelay(
+    phone,
+    `Para confirmar necesito tener una cotización activa en este chat. Dime qué producto o diseño necesitas y te envío las opciones y precios primero.`
   );
 }
 
@@ -1113,12 +1241,57 @@ async function handleCustomerBuffer(phone, messages) {
       return;
     }
 
-    console.log(`🤖 [BUFFER] Procesando solicitud de ${phone} con IA Gemini...`);
+  let parsedData = null;
+  let confirmedFromQuote = false;
+  const pendingQuote = !hasNonTextInput ? getQuoteSession(phone) : null;
+
+  // Una cotización queda asociada solo a esta conversación durante 45 minutos.
+  // Así un "Confirmo el pedido" no crea un pedido viejo o inventado.
+  if (pendingQuote) {
+    const pendingProducts = quoteProducts(pendingQuote.data);
+
+    if (isAlternativeQuote(pendingQuote.data) && !Number.isInteger(pendingQuote.selectedOptionIndex)) {
+      const selectedIndex = findSelectedOptionIndex(currentText, pendingProducts.length);
+
+      if (selectedIndex !== null) {
+        pendingQuote.selectedOptionIndex = selectedIndex;
+        pendingQuote.updatedAt = Date.now();
+        await sendSelectedAlternativePrompt(phone, pendingProducts[selectedIndex], selectedIndex);
+        await markBufferProcessed(bufferIds);
+        return;
+      }
+
+      if (isExplicitOrderConfirmation(currentText)) {
+        await sendAlternativeSelectionReminder(phone, pendingProducts.length);
+        await markBufferProcessed(bufferIds);
+        return;
+      }
+    }
+
+    if (isExplicitOrderConfirmation(currentText)) {
+      parsedData = selectedQuoteData(pendingQuote);
+      confirmedFromQuote = true;
+    }
+  }
+
+  if (!parsedData && !hasNonTextInput && isExplicitOrderConfirmation(currentText)) {
+    await sendFreshQuoteReminder(phone);
+    await markBufferProcessed(bufferIds);
+    return;
+  }
+
+  console.log(`🤖 [BUFFER] Procesando solicitud de ${phone} con IA Gemini...`);
+
+  if (!parsedData) {
     const rulesContext = await getActiveBotRulesContext();
+    const quoteInput = hasNonTextInput ? combinedText : currentText;
     const aiContext = rulesContext
-      ? `${combinedText}\n\n[REGLAS OPERATIVAS DEFINIDAS POR EL ADMIN]\n${rulesContext}`
-      : combinedText;
-    const parsedData = await extractOrderDetails(aiContext, activeOrdersContext);
+      ? `${quoteInput}\n\n[REGLAS OPERATIVAS DEFINIDAS POR EL ADMIN]\n${rulesContext}`
+      : quoteInput;
+
+    // Las cotizaciones nuevas no se mezclan con pedidos anteriores del cliente.
+    parsedData = await extractOrderDetails(aiContext, '');
+  }
 
     if (!parsedData) {
       console.warn(`⚠️ No se obtuvieron datos estructurados para ${phone}`);
@@ -1163,7 +1336,8 @@ async function handleCustomerBuffer(phone, messages) {
     // Mencionar un producto o pedir precios es una cotización, no una orden.
     // El historial de las últimas 24 h permite que un “Confirmo el pedido”
     // posterior recupere estos mismos productos sin que el cliente repita todo.
-    if (!isExplicitOrderConfirmation(currentText)) {
+  if (!confirmedFromQuote) {
+    saveQuoteSession(phone, parsedData);
       console.log(`💬 [COTIZACIÓN] ${phone} consultó ${parsedData.productos.length} producto(s) sin confirmar pedido.`);
       await sendQuoteOnly(phone, parsedData);
       await markBufferProcessed(bufferIds);
@@ -1397,11 +1571,23 @@ async function handleCustomerBuffer(phone, messages) {
     const attachedAssets = messages.filter(m => (m.message_type === 'image' || m.message_type === 'document') && m.media_url);
     const hasAssets = attachedAssets.length > 0;
 
+    const requiredDesignInputs = [
+      '🧩 *Para iniciar el diseño necesitamos:*',
+      '• Texto final y datos de contacto.',
+      '• Logo en buena calidad (PNG, PDF o AI), si aplica.',
+      '• Imágenes o fotos que deban usarse.',
+      '• Referencias de estilo e indicaciones especiales.',
+      '• Medidas finales, si aplican.'
+    ].join('\n');
+
     const assetsNotice = hasAssets
-      ? `📸 Por favor envíanos por aquí la foto del comprobante de transferencia para habilitar tu carpeta de diseño y comenzar la producción.\n\n📁 *Archivos recibidos:* Ya registramos tus insumos/referencias adjuntas; una vez validado el comprobante, el diseñador asignado iniciará con ellos de inmediato.`
-      : `📸 Por favor envíanos por aquí la foto del comprobante de transferencia junto con los archivos e insumos de tu diseño (logos, textos, referencias o enlace si son pesados) para habilitar tu carpeta y comenzar la producción.`;
+      ? `📸 Para habilitar el inicio del diseño, envíanos por aquí el comprobante de transferencia.\n\n📁 *Archivos recibidos:* Ya registramos tus insumos o referencias adjuntas. Una vez validado el comprobante, el diseñador los revisará.\n\n${requiredDesignInputs}`
+      : `📸 Para habilitar el inicio del diseño, envíanos por aquí el comprobante de transferencia y los insumos de tu diseño.\n\n${requiredDesignInputs}`;
 
     const orderIdsHeader = createdOrderItems.map(o => o.id).join(', ');
+    if (createdOrderItems.length > 0) {
+      clearQuoteSession(phone);
+    }
 
     const confirmationMsg =
       `📋 *NEXTAL GRAPHIC - Desglose Formal del Pedido*\n\n` +
