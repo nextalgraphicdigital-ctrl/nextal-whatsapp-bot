@@ -49,13 +49,30 @@ export async function sendSampleToCustomer(req, res) {
       return res.status(400).json({ error: 'No hay una imagen de propuesta para enviar al cliente' });
     }
 
+    let completedChanges = 0;
+    try {
+      const changesRes = await query(
+        `SELECT COUNT(*)::int AS count
+           FROM revisiones
+          WHERE order_id = $1 AND estado = 'cambios_solicitados'`,
+        [orderId]
+      );
+      completedChanges = Number(changesRes.rows[0]?.count || 0);
+    } catch (error) {
+      console.warn(`⚠️ No se pudo contar cambios de ${orderId}:`, error.message);
+    }
+    const nextChange = completedChanges + 1;
+    const changePolicy = nextChange <= 3
+      ? `Si necesitas un ajuste, será el cambio *#${nextChange} de 3 gratuitos* incluidos en tu pedido.`
+      : `Si necesitas un ajuste, será el cambio *#${nextChange}* y tendrá un valor de *$2.000 COP*. Los cambios pendientes de pago se deben cancelar antes de enviar los editables.`;
+
     const messageText = 
       `🎨 *¡Tu propuesta de diseño está lista!*\n\n` +
       `📌 *Pedido:* ${orderId}\n` +
       `✍️ *Tipo:* ${order.tipoDiseno || order.tipo_diseno || ''}\n` +
       `${customNote ? `\n💬 *Nota del diseñador:* ${customNote}\n` : ''}\n` +
       `Por favor revisa la imagen enviada. Responde *"Aprobado"* si todo está correcto o indícanos qué cambios deseas realizar.\n\n` +
-      `✅ Tienes *3 cambios gratuitos*. A partir del *cuarto cambio*, cada ajuste adicional tiene un valor de *$2.000 COP*.`;
+      `✅ ${changePolicy}`;
 
     // Enviar por Baileys con delay anti-baneo (2-7 segundos)
     // El envío tiene un límite para que una conexión interrumpida no deje la
