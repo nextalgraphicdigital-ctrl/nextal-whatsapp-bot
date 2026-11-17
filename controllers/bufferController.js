@@ -14,6 +14,7 @@ const POLICY_IMAGE_PATH = path.join(__dirname, '../assets/politicas-servicio.jpg
 const QUOTE_SESSION_TTL_MS = 45 * 60 * 1000;
 const quoteSessions = new Map();
 const quoteAssets = new Map();
+const orderRoutingPrompts = new Map();
 const ORDER_ID_PREFIX = 'NG-';
 
 // Ventana de silencio para debouncing (10 segundos de inactividad agrupan ráfagas de mensajes)
@@ -25,6 +26,33 @@ let financialColumnsReady = null;
 function getOrderSequenceNumber(orderId) {
   const match = String(orderId || '').match(/^NG-(\d+)$/i);
   return match ? Number(match[1]) : 0;
+}
+
+function findMentionedActiveOrder(text, orders) {
+  const source = String(text || '');
+  return (orders || []).find(order => {
+    const id = String(order?.id || '').trim();
+    return id && new RegExp(`(^|[^A-Z0-9])${id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![A-Z0-9])`, 'i').test(source);
+  }) || null;
+}
+
+function hasMultiplePaymentGroups(orders) {
+  return new Set((orders || []).map(order => order.invoice_id || order.id)).size > 1;
+}
+
+async function requestOrderSelection(phone, orders, action) {
+  const key = `${phone}:${action}`;
+  const previous = orderRoutingPrompts.get(key);
+  if (previous && Date.now() - previous < 15000) return;
+  orderRoutingPrompts.set(key, Date.now());
+
+  const choices = (orders || [])
+    .map(order => `• *${order.id}:* ${order.tipoDiseno || 'Diseño'} (${order.estado || 'En proceso'})`)
+    .join('\n');
+  await sendWhatsAppWithDelay(
+    phone,
+    `Tienes varios pedidos activos. Para vincular correctamente ${action}, responde con el ID correspondiente:\n\n${choices}\n\nEjemplo: *${orders?.[0]?.id || 'NG-0001'}*.`
+  );
 }
 
 /**
@@ -723,7 +751,7 @@ async function handleCustomerBuffer(phone, messages) {
       [clientPhones]
     );
     const activeOrders = activeOrdersRes.rows || [];
-    const activeOrder = activeOrders[0] || null;
+    let activeOrder = activeOrders[0] || null;
     const activeOrdersContext = activeOrders
       .map(o => `- Pedido [${o.id}]: ${o.tipoDiseno} | Estado: ${o.estado} | Valor: $${Number(o.valor).toLocaleString('es-CO')}`)
       .join('\n');
@@ -769,8 +797,14 @@ async function handleCustomerBuffer(phone, messages) {
     const hasNonTextInputForIntent = messages.some(message =>
       ['image', 'document', 'audio'].includes(message.message_type)
     );
+    const explicitlyMentionedOrder = findMentionedActiveOrder(currentTextForIntent, activeOrders);
+    if (explicitlyMentionedOrder) activeOrder = explicitlyMentionedOrder;
     const isReviewAwaitingResponse = activeOrder && ['revision_cliente', 'cambios_solicitados'].includes(activeOrder.qc_status);
     if (!hasNonTextInputForIntent && isReviewAwaitingResponse && isDirectApproval(currentTextForIntent)) {
+      if (activeOrders.length > 1 && !explicitlyMentionedOrder) {
+        await requestOrderSelection(phone, activeOrders, 'tu aprobación');
+        return;
+      }
       console.log(`✅ [APROBACIÓN DIRECTA] Cliente ${phone} aprobó ${activeOrder.id}; validando saldo final.`);
       try {
         await query(
@@ -820,6 +854,11 @@ async function handleCustomerBuffer(phone, messages) {
       if (paymentAnalysis && paymentAnalysis.esComprobanteValido) {
         // CASO 2.1: Comprobante de pago legítimo
         console.log(`✅ [VISION] ¡Comprobante bancario VÁLIDO detectado para ${phone}! Banco: ${paymentAnalysis.banco}, Monto: $${paymentAnalysis.montoDetectado}`);
+
+        if (activeOrders.length > 1 && hasMultiplePaymentGroups(activeOrders) && !explicitlyMentionedOrder) {
+          await requestOrderSelection(phone, activeOrders, 'este comprobante de pago');
+          return;
+        }
 
         if (activeOrder) {
           // 1. Subir la captura del comprobante bancario a Supabase Storage
@@ -1107,6 +1146,10 @@ async function handleCustomerBuffer(phone, messages) {
           // Si el cliente YA TIENE un pedido activo pendiente de pago y envió una imagen (no comprobante),
           // NO generar una nueva cotización: simplemente recordarle que envíe el comprobante.
           if (activeOrder && ['pendiente', 'solicitud recibida', 'solicitud_recibida', 'pago pendiente', 'pendiente_pago'].includes((activeOrder.estado || '').trim().toLowerCase())) {
+            if (activeOrders.length > 1 && !explicitlyMentionedOrder) {
+              await requestOrderSelection(phone, activeOrders, 'estas imágenes o archivos de referencia');
+              return;
+            }
             await uploadDesignAssetsForOrder(activeOrder, messages);
             await sendPendingOrderPackage(phone, activeOrder);
             await markBufferProcessed(bufferIds);
@@ -1121,6 +1164,15 @@ async function handleCustomerBuffer(phone, messages) {
     // (Funciona incluso si el cliente contesta 2 días después de recibir la muestra)
     // =========================================================================
     let targetOrderForFeedback = activeOrder;
+    const hasCreativeAttachments = messages.some(message =>
+      ['image', 'document', 'audio'].includes(message.message_type)
+    );
+    const looksLikeOrderFollowUp = hasCreativeAttachments ||
+      /\b(cambi|ajust|modific|correg|referenc|logo|imagen|foto|archivo|audio|aprueb|avance)\b/i.test(currentTextForIntent);
+    if (activeOrders.length > 1 && !explicitlyMentionedOrder && looksLikeOrderFollowUp) {
+      await requestOrderSelection(phone, activeOrders, 'tus archivos, indicaciones o cambios');
+      return;
+    }
     if (!targetOrderForFeedback) {
       try {
         const recentOrderRes = await query(
