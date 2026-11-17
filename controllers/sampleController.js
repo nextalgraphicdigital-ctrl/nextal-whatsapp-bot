@@ -1,5 +1,6 @@
 import { sendWhatsappWithDelay } from '../services/whatsappTransport.js';
 import { query } from '../config/db.js';
+import { rememberOrderMessage } from '../services/orderMessageLinkService.js';
 
 // Evita dobles clics y peticiones simultáneas para un mismo pedido.
 const sendingOrders = new Set();
@@ -59,10 +60,11 @@ export async function sendSampleToCustomer(req, res) {
     // Enviar por Baileys con delay anti-baneo (2-7 segundos)
     // El envío tiene un límite para que una conexión interrumpida no deje la
     // petición web esperando indefinidamente ni el botón en un estado ambiguo.
-    const success = await Promise.race([
+    const sendResult = await Promise.race([
       sendWhatsappWithDelay(targetPhone, messageText, imageUrl),
       new Promise((_, reject) => setTimeout(() => reject(new Error('El envío a WhatsApp excedió 35 segundos. Verifica la conexión del bot.')), 35_000))
     ]);
+    const success = Boolean(sendResult);
 
     if (success) {
       // Actualizar estado en PostgreSQL
@@ -70,6 +72,12 @@ export async function sendSampleToCustomer(req, res) {
         `UPDATE orders SET qc_status = 'revision_cliente', muestra_url = $1, updated_at = NOW() WHERE id = $2`,
         [imageUrl, orderId]
       );
+      const messageId = typeof sendResult === 'object' ? sendResult.id : null;
+      if (messageId) {
+        await rememberOrderMessage({ messageId, orderId, phone: targetPhone, kind: 'proposal' });
+      } else {
+        console.warn(`⚠️ No se recibió ID de WhatsApp al enviar la propuesta de ${orderId}; se usará el ID visible en el mensaje como respaldo.`);
+      }
 
       return res.json({ success: true, message: `Muestra enviada exitosamente por WhatsApp a ${targetPhone}` });
     } else {

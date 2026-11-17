@@ -6,7 +6,8 @@ import { transcribeAudio } from '../services/whisperService.js';
 import { extractOrderDetails, validatePaymentReceipt, detectFeedbackOrAdjustment, assignDesignAssetsToProducts } from '../services/geminiService.js';
 import { createOrderFolder, getFolderIdFromUrl, uploadBase64ToFolder, getFinalDeliverables, renameOrderFolder } from '../services/driveService.js';
 import { sendWhatsAppWithDelay } from '../services/whatsappTransport.js';
-import { getActiveBotRulesContext, notifyNewOrderBatch } from '../services/telegramControlService.js';
+import { getActiveBotRulesContext, notifyNewOrderBatch, requestHumanIntervention } from '../services/telegramControlService.js';
+import { findOrderForReply } from '../services/orderMessageLinkService.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -15,6 +16,7 @@ const QUOTE_SESSION_TTL_MS = 45 * 60 * 1000;
 const quoteSessions = new Map();
 const quoteAssets = new Map();
 const orderRoutingPrompts = new Map();
+const orderRoutingPromptedBatches = new Set();
 const ORDER_ID_PREFIX = 'NG-';
 
 // Ventana de silencio para debouncing (10 segundos de inactividad agrupan ráfagas de mensajes)
@@ -40,11 +42,18 @@ function hasMultiplePaymentGroups(orders) {
   return new Set((orders || []).map(order => order.invoice_id || order.id)).size > 1;
 }
 
-async function requestOrderSelection(phone, orders, action) {
+async function requestOrderSelection(phone, orders, action, bufferIds = []) {
   const key = `${phone}:${action}`;
-  const previous = orderRoutingPrompts.get(key);
-  if (previous && Date.now() - previous < 15000) return;
+  const batchKey = `${key}:${[...bufferIds].sort((a, b) => Number(a) - Number(b)).join(',')}`;
+  if (orderRoutingPromptedBatches.has(batchKey)) return;
+  orderRoutingPromptedBatches.add(batchKey);
   orderRoutingPrompts.set(key, Date.now());
+
+  const handoff = await requestHumanIntervention({
+    phone,
+    summary: `No se pudo identificar a cuál pedido corresponde ${action}. Pedidos posibles: ${(orders || []).map(order => order.id).join(', ')}.`
+  });
+  if (handoff?.escalated) return;
 
   const choices = (orders || [])
     .map(order => `• *${order.id}:* ${order.tipoDiseno || 'Diseño'} (${order.estado || 'En proceso'})`)
@@ -808,6 +817,12 @@ async function handleCustomerBuffer(phone, messages) {
       ['image', 'document', 'audio'].includes(message.message_type)
     );
     const explicitlyMentionedOrder = findMentionedActiveOrder(currentTextForIntent, activeOrders);
+    let replyLinkedOrder = null;
+    try {
+      replyLinkedOrder = await findOrderForReply(messages, activeOrders);
+    } catch (error) {
+      console.warn('⚠️ No se pudo resolver la respuesta citada de WhatsApp:', error.message);
+    }
     const activeQuoteSession = getQuoteSession(phone);
     const isNewQuoteInProgress = Boolean(activeQuoteSession && (
       activeQuoteSession.awaitingDesignInputs ||
@@ -816,10 +831,12 @@ async function handleCustomerBuffer(phone, messages) {
     ));
     const isNewRequest = isNewCommercialRequest(currentTextForIntent);
     if (explicitlyMentionedOrder) activeOrder = explicitlyMentionedOrder;
+    else if (replyLinkedOrder) activeOrder = replyLinkedOrder;
+    const hasResolvedOrderReference = Boolean(explicitlyMentionedOrder || replyLinkedOrder);
     const isReviewAwaitingResponse = activeOrder && ['revision_cliente', 'cambios_solicitados'].includes(activeOrder.qc_status);
     if (!hasNonTextInputForIntent && isReviewAwaitingResponse && isDirectApproval(currentTextForIntent)) {
-      if (activeOrders.length > 1 && !explicitlyMentionedOrder) {
-        await requestOrderSelection(phone, activeOrders, 'tu aprobación');
+      if (activeOrders.length > 1 && !hasResolvedOrderReference) {
+        await requestOrderSelection(phone, activeOrders, 'tu aprobación', bufferIds);
         return;
       }
       console.log(`✅ [APROBACIÓN DIRECTA] Cliente ${phone} aprobó ${activeOrder.id}; validando saldo final.`);
@@ -872,8 +889,8 @@ async function handleCustomerBuffer(phone, messages) {
         // CASO 2.1: Comprobante de pago legítimo
         console.log(`✅ [VISION] ¡Comprobante bancario VÁLIDO detectado para ${phone}! Banco: ${paymentAnalysis.banco}, Monto: $${paymentAnalysis.montoDetectado}`);
 
-        if (activeOrders.length > 1 && hasMultiplePaymentGroups(activeOrders) && !explicitlyMentionedOrder) {
-          await requestOrderSelection(phone, activeOrders, 'este comprobante de pago');
+        if (activeOrders.length > 1 && hasMultiplePaymentGroups(activeOrders) && !hasResolvedOrderReference) {
+          await requestOrderSelection(phone, activeOrders, 'este comprobante de pago', bufferIds);
           return;
         }
 
@@ -1163,8 +1180,8 @@ async function handleCustomerBuffer(phone, messages) {
           // Si el cliente YA TIENE un pedido activo pendiente de pago y envió una imagen (no comprobante),
           // NO generar una nueva cotización: simplemente recordarle que envíe el comprobante.
           if (!isNewQuoteInProgress && !isNewRequest && activeOrder && ['pendiente', 'solicitud recibida', 'solicitud_recibida', 'pago pendiente', 'pendiente_pago'].includes((activeOrder.estado || '').trim().toLowerCase())) {
-            if (activeOrders.length > 1 && !explicitlyMentionedOrder) {
-              await requestOrderSelection(phone, activeOrders, 'estas imágenes o archivos de referencia');
+            if (activeOrders.length > 1 && !hasResolvedOrderReference) {
+              await requestOrderSelection(phone, activeOrders, 'estas imágenes o archivos de referencia', bufferIds);
               return;
             }
             await uploadDesignAssetsForOrder(activeOrder, messages);
@@ -1186,8 +1203,8 @@ async function handleCustomerBuffer(phone, messages) {
     );
     const looksLikeOrderFollowUp = hasCreativeAttachments ||
       /\b(cambi|ajust|modific|correg|referenc|logo|imagen|foto|archivo|audio|aprueb|avance)\b/i.test(currentTextForIntent);
-    if (activeOrders.length > 1 && !explicitlyMentionedOrder && !isNewQuoteInProgress && !isNewRequest && looksLikeOrderFollowUp) {
-      await requestOrderSelection(phone, activeOrders, 'tus archivos, indicaciones o cambios');
+    if (activeOrders.length > 1 && !hasResolvedOrderReference && !isNewQuoteInProgress && !isNewRequest && looksLikeOrderFollowUp) {
+      await requestOrderSelection(phone, activeOrders, 'tus archivos, indicaciones o cambios', bufferIds);
       return;
     }
     if (!targetOrderForFeedback) {
@@ -1515,7 +1532,7 @@ async function handleCustomerBuffer(phone, messages) {
             `📸 Envíanos por aquí la foto o captura del comprobante de transferencia para habilitar tu carpeta de diseño e iniciar la producción.`;
         } else {
           responseText =
-            '¡Hola! 👋 Bienvenido a Nextal Graphic, tu aliado creativo del sector publicitario.\n¿En qué servicio te podemos colaborar hoy? Cuéntanos los detalles de tu requerimiento y con gusto te cotizamos.';
+            '¡Hola! 👋 Bienvenido a Nextal Graphic, tu aliado creativo del sector publicitario.\n¿En qué podemos ayudarte hoy?';
         }
       }
 

@@ -368,15 +368,17 @@ export async function sendWhatsappWithDelay(phoneOrOptions, textParam, mediaUrlP
           ? fs.readFileSync(mediaUrl)
           : { url: mediaUrl };
 
-      await sendWithTimeout(jid, {
+      const sent = await sendWithTimeout(jid, {
         image: imagePayload,
         caption: text,
       });
+      console.log(`✅ Mensaje enviado exitosamente a ${jid}`);
+      return { ok: true, id: sent?.key?.id || null };
     } else {
-      await sendWithTimeout(jid, { text });
+      const sent = await sendWithTimeout(jid, { text });
+      console.log(`✅ Mensaje enviado exitosamente a ${jid}`);
+      return { ok: true, id: sent?.key?.id || null };
     }
-    console.log(`✅ Mensaje enviado exitosamente a ${jid}`);
-    return true;
   } catch (error) {
     console.error(`❌ Error al enviar mensaje por Baileys a ${jid}:`, error.message);
     // Si falló y era @s.whatsapp.net con dígitos de LID, reintentar con @lid
@@ -391,12 +393,14 @@ export async function sendWhatsappWithDelay(phoneOrOptions, textParam, mediaUrlP
               ? fs.readFileSync(mediaUrl)
               : { url: mediaUrl };
 
-          await sendWithTimeout(lidJid, { image: imagePayload, caption: text });
+          const sent = await sendWithTimeout(lidJid, { image: imagePayload, caption: text });
+          console.log(`✅ Mensaje enviado exitosamente a ${lidJid}`);
+          return { ok: true, id: sent?.key?.id || null };
         } else {
-          await sendWithTimeout(lidJid, { text });
+          const sent = await sendWithTimeout(lidJid, { text });
+          console.log(`✅ Mensaje enviado exitosamente a ${lidJid}`);
+          return { ok: true, id: sent?.key?.id || null };
         }
-        console.log(`✅ Mensaje enviado exitosamente a ${lidJid}`);
-        return true;
       } catch (lidErr) {
         console.error(`❌ Reintento con ${lidJid} falló:`, lidErr.message);
       }

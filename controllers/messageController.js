@@ -1,5 +1,6 @@
 import { query } from '../config/db.js';
 import { downloadMediaMessage } from '@whiskeysockets/baileys';
+import { ensureOrderMessageSchema } from '../services/orderMessageLinkService.js';
 
 /**
  * Escucha los mensajes entrantes de WhatsApp de Baileys
@@ -36,6 +37,10 @@ export async function handleInboundMessage(msg, sock) {
                            m?.videoMessage?.caption ||
                            m?.documentMessage?.caption ||
                            '';
+    const replyToMessageId = m?.extendedTextMessage?.contextInfo?.stanzaId ||
+      m?.imageMessage?.contextInfo?.stanzaId ||
+      m?.documentMessage?.contextInfo?.stanzaId ||
+      m?.audioMessage?.contextInfo?.stanzaId || null;
 
     let messageType = 'text';
     let mediaUrl = null;
@@ -101,13 +106,14 @@ export async function handleInboundMessage(msg, sock) {
     // ON CONFLICT (msg_id) DO NOTHING garantiza que Baileys no duplique el mismo mensaje
     // aunque dispare messages.upsert mÃºltiples veces (reintentos Signal, reconexiones, historial)
     // Deduplicación via WHERE NOT EXISTS (compatible con índices parciales de PostgreSQL)
+    await ensureOrderMessageSchema();
     const result = await query(
-      `INSERT INTO whatsapp_inbound_buffer (phone_number, message_type, content, media_url, processed, msg_id, created_at)
-       SELECT $1, $2, $3, $4, false, $5, NOW()
+      `INSERT INTO whatsapp_inbound_buffer (phone_number, message_type, content, media_url, processed, msg_id, reply_to_msg_id, created_at)
+       SELECT $1, $2, $3, $4, false, $5, $6, NOW()
        WHERE NOT EXISTS (
          SELECT 1 FROM whatsapp_inbound_buffer WHERE msg_id = $5 AND msg_id IS NOT NULL
        )`,
-      [phoneNumber, messageType, messageContent, mediaUrl, msgId]
+      [phoneNumber, messageType, messageContent, mediaUrl, msgId, replyToMessageId]
     );
 
     console.log(`âœ… Mensaje de ${phoneNumber} [id: ${msgId}] insertado en buffer (o ignorado si duplicado).`);

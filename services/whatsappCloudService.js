@@ -62,13 +62,13 @@ export async function sendWhatsappWithDelay(phoneOrOptions, textParam, mediaUrlP
     } else {
       message = { messaging_product: 'whatsapp', to, type: 'text', text: { body: String(text || '') } };
     }
-    await graphRequest(`${phoneNumberId()}/messages`, {
+    const response = await graphRequest(`${phoneNumberId()}/messages`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(message)
     });
     console.log(`✅ [Cloud API] Mensaje enviado a ${to}`);
-    return true;
+    return { ok: true, id: response?.messages?.[0]?.id || null };
   } catch (error) {
     console.error(`❌ [Cloud API] No se pudo enviar mensaje: ${error.message}`);
     return false;
