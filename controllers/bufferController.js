@@ -107,7 +107,9 @@ async function getNextSynchronizedOrderId() {
   const supabaseUrl = process.env.SUPABASE_URL || 'https://ygpfvmevizoetnvsxsqu.supabase.co';
   const supabaseKey = process.env.SUPABASE_ANON_KEY || 'sb_publishable_f3fibrFoyyjwmAQ1rX1X-Q_UVS3nQtm';
   const remoteResponse = await fetch(
-    `${supabaseUrl}/rest/v1/orders?select=id&id=like.NG-*&order=id.desc&limit=1`,
+    // No usamos order=id.desc: Supabase ordenaría texto y NG-999 podría
+    // quedar por encima de NG-1000. Se calcula el máximo numérico real.
+    `${supabaseUrl}/rest/v1/orders?select=id&id=like.NG-*&limit=10000`,
     { headers: { apikey: supabaseKey, Authorization: `Bearer ${supabaseKey}` } }
   );
 
@@ -116,7 +118,8 @@ async function getNextSynchronizedOrderId() {
   }
 
   const remoteRows = await remoteResponse.json();
-  const remoteMax = getOrderSequenceNumber(remoteRows?.[0]?.id);
+  const remoteMax = (Array.isArray(remoteRows) ? remoteRows : [])
+    .reduce((max, order) => Math.max(max, getOrderSequenceNumber(order?.id)), 0);
   const next = Math.max(localMax, remoteMax) + 1;
   return `${ORDER_ID_PREFIX}${String(next).padStart(4, '0')}`;
 }
