@@ -550,8 +550,17 @@ async function sendSelectedAlternativePrompt(phone, product, index) {
   const price = Number(product?.precioUnitario || 0).toLocaleString('es-CO');
   await sendWhatsAppWithDelay(
     phone,
-    `✅ Elegiste la opción *${optionLabel(index)}*: *${formatQuoteProductName(product)}* por *$${price} COP*.\n\nEsta cotización aún no crea pedido ni genera cobro. Si quieres continuar, responde exactamente: *Confirmo el pedido*.`
+    `✅ Elegiste la opción *${optionLabel(index)}*: *${formatQuoteProductName(product)}* por *$${price} COP*.\n\n` +
+    `Para preparar tu diseño, envíanos por este chat los insumos que lleve: *texto final y datos*, logo, imágenes o fotos, referencias de estilo, medidas e indicaciones especiales.\n\n` +
+    `Cuando los recibamos, continuaremos automáticamente con tu pedido. No necesitas escribir “Confirmo el pedido”.`
   );
+}
+
+function hasUsableDesignInput(text, assets) {
+  if (Array.isArray(assets) && assets.length > 0) return true;
+  const clean = normalizeFlowText(text);
+  if (!clean) return false;
+  return !/^(ok|okay|listo|hola|buenas|gracias|si|no)$/.test(clean);
 }
 
 async function sendAlternativeSelectionReminder(phone, count) {
@@ -1312,20 +1321,53 @@ async function handleCustomerBuffer(phone, messages) {
 
       if (selectedIndex !== null) {
         pendingQuote.selectedOptionIndex = selectedIndex;
+        pendingQuote.assets = mergeDesignAssets(
+          pendingQuote.assets || [],
+          rememberedDesignAssets,
+          incomingDesignAssets
+        );
         pendingQuote.updatedAt = Date.now();
-        await sendSelectedAlternativePrompt(phone, pendingProducts[selectedIndex], selectedIndex);
-        await markBufferProcessed(bufferIds);
-        return;
+
+        // Elegir A/B/C/D ya confirma la alternativa comercial. Si los
+        // insumos llegaron antes, se crea el pedido de inmediato; si faltan,
+        // se solicitan y el siguiente mensaje útil continuará el flujo.
+        if (pendingQuote.assets.length > 0) {
+          parsedData = selectedQuoteData(pendingQuote);
+          confirmedFromQuote = true;
+        } else {
+          pendingQuote.awaitingDesignInputs = true;
+          await sendSelectedAlternativePrompt(phone, pendingProducts[selectedIndex], selectedIndex);
+          await markBufferProcessed(bufferIds);
+          return;
+        }
       }
 
-      if (isExplicitOrderConfirmation(currentText)) {
+      if (!confirmedFromQuote && isExplicitOrderConfirmation(currentText)) {
         await sendAlternativeSelectionReminder(phone, pendingProducts.length);
         await markBufferProcessed(bufferIds);
         return;
       }
     }
 
-    if (isExplicitOrderConfirmation(currentText)) {
+    if (
+      !confirmedFromQuote &&
+      isAlternativeQuote(pendingQuote.data) &&
+      Number.isInteger(pendingQuote.selectedOptionIndex) &&
+      pendingQuote.awaitingDesignInputs &&
+      hasUsableDesignInput(currentText, incomingDesignAssets)
+    ) {
+      pendingQuote.assets = mergeDesignAssets(
+        pendingQuote.assets || [],
+        rememberedDesignAssets,
+        incomingDesignAssets
+      );
+      pendingQuote.awaitingDesignInputs = false;
+      pendingQuote.updatedAt = Date.now();
+      parsedData = selectedQuoteData(pendingQuote);
+      confirmedFromQuote = true;
+    }
+
+    if (!confirmedFromQuote && isExplicitOrderConfirmation(currentText)) {
       parsedData = selectedQuoteData(pendingQuote);
       confirmedFromQuote = true;
     }
@@ -1633,9 +1675,6 @@ async function handleCustomerBuffer(phone, messages) {
       ? `📁 *Insumos registrados:* recibimos ${attachedAssets.length} archivo(s) o imagen(es) y ya quedaron vinculados a este pedido.`
       : '📎 *Insumos pendientes:* envíanos por este chat los archivos, imágenes, textos, logos, datos y referencias necesarios. Los vincularemos a este pedido.';
 
-    const paymentNotice =
-      '📸 *Siguiente paso:* envíanos una imagen legible del comprobante de transferencia del abono. Validaremos que sea un comprobante bancario y que cubra el abono requerido antes de iniciar el diseño. Si el valor es mayor, se registrará a favor del pedido.';
-
     const orderIdsHeader = createdOrderItems.map(o => o.id).join(', ');
     if (createdOrderItems.length > 0) {
       clearQuoteSession(phone);
@@ -1647,7 +1686,6 @@ async function handleCustomerBuffer(phone, messages) {
       `📝 *Detalle de Productos:*\n${itemsSummary}\n\n` +
       `${financialSection}` +
       `${assetsNotice}\n\n` +
-      `${paymentNotice}\n\n` +
       `🔗 *¿Aún no te has registrado?* Te invitamos a registrarte en nuestra plataforma oficial:\nhttps://nextal-graphic-interno-2.vercel.app/clientes#`;
 
     // 1. Enviar primero la infografía de políticas de servicio con caption corto
