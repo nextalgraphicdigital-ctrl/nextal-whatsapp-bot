@@ -15,6 +15,7 @@ const POLICY_IMAGE_PATH = path.join(__dirname, '../assets/politicas-servicio.jpg
 const QUOTE_SESSION_TTL_MS = 45 * 60 * 1000;
 const quoteSessions = new Map();
 const quoteAssets = new Map();
+let quoteSessionSchemaReady = null;
 const orderRoutingPrompts = new Map();
 const orderRoutingPromptedBatches = new Set();
 const ORDER_ID_PREFIX = 'NG-';
@@ -608,6 +609,95 @@ function clearQuoteSession(phone) {
   getQuoteSessionKeys(phone).forEach(key => quoteAssets.delete(key));
 }
 
+function quoteSessionStorageKey(phone) {
+  return getQuoteSessionKeys(phone).find(key => /^\d+$/.test(key)) || String(phone || '').trim();
+}
+
+async function ensureQuoteSessionSchema() {
+  if (!quoteSessionSchemaReady) {
+    quoteSessionSchemaReady = query(`
+      CREATE TABLE IF NOT EXISTS whatsapp_quote_sessions (
+        phone TEXT PRIMARY KEY,
+        session_data JSONB NOT NULL,
+        selected_option_index INTEGER,
+        awaiting_design_inputs BOOLEAN NOT NULL DEFAULT false,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `).catch(error => {
+      quoteSessionSchemaReady = null;
+      throw error;
+    });
+  }
+  return quoteSessionSchemaReady;
+}
+
+async function persistQuoteSession(phone, session) {
+  try {
+    await ensureQuoteSessionSchema();
+    await query(
+      `INSERT INTO whatsapp_quote_sessions (phone, session_data, selected_option_index, awaiting_design_inputs, updated_at)
+       VALUES ($1, $2::jsonb, $3, $4, NOW())
+       ON CONFLICT (phone) DO UPDATE SET
+         session_data = EXCLUDED.session_data,
+         selected_option_index = EXCLUDED.selected_option_index,
+         awaiting_design_inputs = EXCLUDED.awaiting_design_inputs,
+         updated_at = NOW()`,
+      [
+        quoteSessionStorageKey(phone),
+        JSON.stringify(session?.data || {}),
+        Number.isInteger(session?.selectedOptionIndex) ? session.selectedOptionIndex : null,
+        Boolean(session?.awaitingDesignInputs)
+      ]
+    );
+  } catch (error) {
+    // La conversación no se detiene si el almacenamiento auxiliar falla.
+    console.warn('⚠️ No se pudo persistir la cotización activa:', error.message);
+  }
+}
+
+async function restoreQuoteSession(phone) {
+  if (getQuoteSession(phone)) return;
+  try {
+    await ensureQuoteSessionSchema();
+    const result = await query(
+      `SELECT session_data, selected_option_index, awaiting_design_inputs, updated_at
+         FROM whatsapp_quote_sessions
+        WHERE phone = $1
+        LIMIT 1`,
+      [quoteSessionStorageKey(phone)]
+    );
+    const row = result.rows[0];
+    if (!row) return;
+
+    const updatedAt = new Date(row.updated_at).getTime();
+    if (!Number.isFinite(updatedAt) || Date.now() - updatedAt > QUOTE_SESSION_TTL_MS) {
+      await query(`DELETE FROM whatsapp_quote_sessions WHERE phone = $1`, [quoteSessionStorageKey(phone)]);
+      return;
+    }
+
+    const data = typeof row.session_data === 'string' ? JSON.parse(row.session_data) : row.session_data;
+    const session = {
+      data: cloneQuoteData(data),
+      selectedOptionIndex: Number.isInteger(row.selected_option_index) ? row.selected_option_index : null,
+      awaitingDesignInputs: Boolean(row.awaiting_design_inputs),
+      assets: [],
+      updatedAt
+    };
+    getQuoteSessionKeys(phone).forEach(key => quoteSessions.set(key, session));
+  } catch (error) {
+    console.warn('⚠️ No se pudo restaurar la cotización activa:', error.message);
+  }
+}
+
+async function clearPersistedQuoteSession(phone) {
+  try {
+    await ensureQuoteSessionSchema();
+    await query(`DELETE FROM whatsapp_quote_sessions WHERE phone = $1`, [quoteSessionStorageKey(phone)]);
+  } catch (error) {
+    console.warn('⚠️ No se pudo cerrar la cotización activa:', error.message);
+  }
+}
+
 function findSelectedOptionIndex(text, optionCount) {
   const clean = normalizeFlowText(text);
   for (let index = 0; index < optionCount; index += 1) {
@@ -854,6 +944,9 @@ async function handleCustomerBuffer(phone, messages) {
     } catch (error) {
       console.warn('⚠️ No se pudo resolver la respuesta citada de WhatsApp:', error.message);
     }
+    // Recupera el punto exacto del flujo aunque el proceso del bot se haya
+    // reiniciado entre la cotización y el envío de los insumos.
+    await restoreQuoteSession(phone);
     const activeQuoteSession = getQuoteSession(phone);
     const isNewQuoteInProgress = Boolean(activeQuoteSession && (
       activeQuoteSession.awaitingDesignInputs ||
@@ -1519,6 +1612,7 @@ async function handleCustomerBuffer(phone, messages) {
           incomingDesignAssets
         );
         pendingQuote.updatedAt = Date.now();
+        await persistQuoteSession(phone, pendingQuote);
 
         // Elegir A/B/C/D ya confirma la alternativa comercial. Si los
         // insumos llegaron antes, se crea el pedido de inmediato; si faltan,
@@ -1630,7 +1724,8 @@ async function handleCustomerBuffer(phone, messages) {
     // El historial de las últimas 24 h permite que un “Confirmo el pedido”
     // posterior recupere estos mismos productos sin que el cliente repita todo.
   if (!confirmedFromQuote) {
-    saveQuoteSession(phone, parsedData, rememberedDesignAssets);
+    const savedQuoteSession = saveQuoteSession(phone, parsedData, rememberedDesignAssets);
+    await persistQuoteSession(phone, savedQuoteSession);
       console.log(`💬 [COTIZACIÓN] ${phone} consultó ${parsedData.productos.length} producto(s) sin confirmar pedido.`);
       await sendQuoteOnly(phone, parsedData);
       await markBufferProcessed(bufferIds);
@@ -1859,6 +1954,7 @@ async function handleCustomerBuffer(phone, messages) {
     const orderIdsHeader = createdOrderItems.map(o => o.id).join(', ');
     if (createdOrderItems.length > 0) {
       clearQuoteSession(phone);
+      await clearPersistedQuoteSession(phone);
     }
 
     const confirmationMsg =
