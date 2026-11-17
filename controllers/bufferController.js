@@ -384,6 +384,16 @@ function isCommercialOrGreetingQuery(text) {
   return commercialWords.some((w) => clean.includes(w));
 }
 
+/** Distingue una cotización nueva de un comentario sobre un pedido anterior. */
+function isNewCommercialRequest(text) {
+  const clean = normalizeFlowText(text);
+  if (!clean) return false;
+  if (/\b(cambi|ajust|modific|correg|aprueb|avance|estado|entrega|pago|comprobante)\b/.test(clean)) {
+    return false;
+  }
+  return /\b(necesito|quiero|cotiz|precio|cuanto|hacen|ofrecen|me gustaria|nuevo diseno|otro diseno)\b/.test(clean);
+}
+
 /**
  * Cierre determinista para evitar que una alucinación del modelo convierta un
  * saludo aislado en una orden. Solo permite palabras de cortesía, espacios y
@@ -593,7 +603,7 @@ async function sendQuoteOnly(phone, parsedData) {
 
     await sendWhatsAppWithDelay(
       phone,
-      `💬 *Opciones de cotización*\n\n${options}\n\n⚠️ Son alternativas: eliges una, por eso no se suman entre sí.\n\nResponde con *${labels}* para elegir la opción que necesitas. Después te pediremos confirmar el pedido.`
+      `💬 *Opciones de cotización*\n\n${options}\n\n⚠️ Son alternativas: eliges una, por eso no se suman entre sí.\n\nResponde con *${labels}* para elegir la opción que necesitas. Después te pediremos los insumos del diseño.`
     );
     return;
   }
@@ -617,7 +627,7 @@ async function sendSelectedAlternativePrompt(phone, product, index) {
     phone,
     `✅ Elegiste la opción *${optionLabel(index)}*: *${formatQuoteProductName(product)}* por *$${price} COP*.\n\n` +
     `Para preparar tu diseño, envíanos por este chat los insumos que lleve: *texto final y datos*, logo, imágenes o fotos, referencias de estilo, medidas e indicaciones especiales.\n\n` +
-    `Cuando los recibamos, continuaremos automáticamente con tu pedido. No necesitas escribir “Confirmo el pedido”.`
+    `Cuando los recibamos, continuaremos automáticamente con tu pedido.`
   );
 }
 
@@ -798,6 +808,13 @@ async function handleCustomerBuffer(phone, messages) {
       ['image', 'document', 'audio'].includes(message.message_type)
     );
     const explicitlyMentionedOrder = findMentionedActiveOrder(currentTextForIntent, activeOrders);
+    const activeQuoteSession = getQuoteSession(phone);
+    const isNewQuoteInProgress = Boolean(activeQuoteSession && (
+      activeQuoteSession.awaitingDesignInputs ||
+      Number.isInteger(activeQuoteSession.selectedOptionIndex) ||
+      quoteProducts(activeQuoteSession.data).length > 0
+    ));
+    const isNewRequest = isNewCommercialRequest(currentTextForIntent);
     if (explicitlyMentionedOrder) activeOrder = explicitlyMentionedOrder;
     const isReviewAwaitingResponse = activeOrder && ['revision_cliente', 'cambios_solicitados'].includes(activeOrder.qc_status);
     if (!hasNonTextInputForIntent && isReviewAwaitingResponse && isDirectApproval(currentTextForIntent)) {
@@ -1126,7 +1143,7 @@ async function handleCustomerBuffer(phone, messages) {
 
         const isExplicitPaymentClaim = isPaymentClaimWithoutReceipt(combinedText);
 
-        if (isAwaitingPayment && (isExplicitPaymentClaim || messages.length === 1)) {
+        if (!isNewQuoteInProgress && !isNewRequest && isAwaitingPayment && (isExplicitPaymentClaim || messages.length === 1)) {
           const motivo = paymentAnalysis?.motivo || 'no se aprecian datos de transferencia bancaria ni monto';
           console.log(`⚠️ [VISION] Comprobante no válido para ${phone}: ${motivo}`);
 
@@ -1145,7 +1162,7 @@ async function handleCustomerBuffer(phone, messages) {
 
           // Si el cliente YA TIENE un pedido activo pendiente de pago y envió una imagen (no comprobante),
           // NO generar una nueva cotización: simplemente recordarle que envíe el comprobante.
-          if (activeOrder && ['pendiente', 'solicitud recibida', 'solicitud_recibida', 'pago pendiente', 'pendiente_pago'].includes((activeOrder.estado || '').trim().toLowerCase())) {
+          if (!isNewQuoteInProgress && !isNewRequest && activeOrder && ['pendiente', 'solicitud recibida', 'solicitud_recibida', 'pago pendiente', 'pendiente_pago'].includes((activeOrder.estado || '').trim().toLowerCase())) {
             if (activeOrders.length > 1 && !explicitlyMentionedOrder) {
               await requestOrderSelection(phone, activeOrders, 'estas imágenes o archivos de referencia');
               return;
@@ -1169,7 +1186,7 @@ async function handleCustomerBuffer(phone, messages) {
     );
     const looksLikeOrderFollowUp = hasCreativeAttachments ||
       /\b(cambi|ajust|modific|correg|referenc|logo|imagen|foto|archivo|audio|aprueb|avance)\b/i.test(currentTextForIntent);
-    if (activeOrders.length > 1 && !explicitlyMentionedOrder && looksLikeOrderFollowUp) {
+    if (activeOrders.length > 1 && !explicitlyMentionedOrder && !isNewQuoteInProgress && !isNewRequest && looksLikeOrderFollowUp) {
       await requestOrderSelection(phone, activeOrders, 'tus archivos, indicaciones o cambios');
       return;
     }
@@ -1347,7 +1364,7 @@ async function handleCustomerBuffer(phone, messages) {
       // ¡NO SE SILENCIA! Se permite que la IA de Gemini responda de forma natural y fluida.
       const isAskingCatalogOrGreeting = isCommercialOrGreetingQuery(combinedText);
 
-      if (!isAskingCatalogOrGreeting) {
+      if (!isAskingCatalogOrGreeting && !isNewQuoteInProgress && !isNewRequest) {
         // Mensajes casuales de espera ("ok", "listo", "me avisan", "¿ya lo vieron?"):
         // Se silencian para no enviar respuestas automáticas repetitivas mientras el admin revisa.
         console.log(`⏸️ [GATEKEEPER] Cliente ${phone} con pedido en espera (${activeOrder.id}). Mensaje casual silenciado sin spam.`);
