@@ -42,6 +42,25 @@ function hasMultiplePaymentGroups(orders) {
   return new Set((orders || []).map(order => order.invoice_id || order.id)).size > 1;
 }
 
+function isAwaitingPayment(order) {
+  const status = String(order?.estado || '').trim().toLowerCase();
+  return ['pendiente', 'solicitud recibida', 'solicitud_recibida', 'pago pendiente', 'pendiente_pago'].includes(status);
+}
+
+/**
+ * Tras crear un pedido el cliente normalmente envía el comprobante enseguida.
+ * Se asigna automáticamente solo cuando hay un único pedido nuevo esperando
+ * pago en las últimas dos horas; los pedidos antiguos no generan ambigüedad.
+ */
+function findRecentPaymentOrder(orders) {
+  const cutoff = Date.now() - (2 * 60 * 60 * 1000);
+  const candidates = (orders || []).filter(order => {
+    const createdAt = new Date(order?.created_at || 0).getTime();
+    return isAwaitingPayment(order) && Number.isFinite(createdAt) && createdAt >= cutoff;
+  });
+  return candidates.length === 1 ? candidates[0] : null;
+}
+
 function clearOrderRoutingState(phone) {
   for (const key of orderRoutingPrompts.keys()) {
     if (key.startsWith(`${phone}:`)) orderRoutingPrompts.delete(key);
@@ -922,7 +941,22 @@ async function handleCustomerBuffer(phone, messages) {
         // CASO 2.1: Comprobante de pago legítimo
         console.log(`✅ [VISION] ¡Comprobante bancario VÁLIDO detectado para ${phone}! Banco: ${paymentAnalysis.banco}, Monto: $${paymentAnalysis.montoDetectado}`);
 
-        if (activeOrders.length > 1 && hasMultiplePaymentGroups(activeOrders) && !hasResolvedOrderReference) {
+        // Si el comprobante llegó inmediatamente después de un pedido recién
+        // creado, ese pedido tiene prioridad sobre órdenes antiguas del chat.
+        const recentPaymentOrder = !hasResolvedOrderReference
+          ? findRecentPaymentOrder(activeOrders)
+          : null;
+        if (recentPaymentOrder) {
+          activeOrder = recentPaymentOrder;
+          clearOrderRoutingState(phone);
+          try {
+            await resolveHumanIntervention(phone);
+          } catch (error) {
+            console.warn('⚠️ No se pudo cerrar la aclaración anterior de pago:', error.message);
+          }
+        }
+
+        if (!recentPaymentOrder && activeOrders.length > 1 && hasMultiplePaymentGroups(activeOrders) && !hasResolvedOrderReference) {
           await requestOrderSelection(phone, activeOrders, 'este comprobante de pago', bufferIds);
           return;
         }
