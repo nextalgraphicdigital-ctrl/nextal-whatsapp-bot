@@ -1271,7 +1271,12 @@ async function handleCustomerBuffer(phone, messages) {
     // =========================================================================
     // Una cotización nueva no puede convertirse en comentario de un pedido
     // anterior, aunque el cliente tenga varios pedidos activos en el chat.
-    let targetOrderForFeedback = startsNewCommercialFlow ? null : activeOrder;
+    // Mientras haya una cotización activa (antes o después de A/B/C/D), los
+    // insumos pertenecen a esa cotización. No se permite que un pedido viejo
+    // los capture como si fueran una corrección o referencia suya.
+    let targetOrderForFeedback = (startsNewCommercialFlow || isNewQuoteInProgress)
+      ? null
+      : activeOrder;
     const hasCreativeAttachments = messages.some(message =>
       ['image', 'document', 'audio'].includes(message.message_type)
     );
@@ -1281,7 +1286,7 @@ async function handleCustomerBuffer(phone, messages) {
       await requestOrderSelection(phone, activeOrders, 'tus archivos, indicaciones o cambios', bufferIds);
       return;
     }
-    if (!startsNewCommercialFlow && !targetOrderForFeedback) {
+    if (!startsNewCommercialFlow && !isNewQuoteInProgress && !targetOrderForFeedback) {
       try {
         const recentOrderRes = await query(
           `SELECT id, "tipoDiseno", valor, estado, qc_status, notes, drive_url, "driveFolderId", "driveFolderUrl", created_at
