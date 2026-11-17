@@ -91,6 +91,26 @@ export async function createOrderFolder(folderName) {
   }
 }
 
+/** Mantiene las carpetas de pedidos con una nomenclatura única: NG-####. */
+export async function renameOrderFolder(folderId, orderId) {
+  if (!folderId || !orderId) return null;
+  const drive = getGoogleDriveClient();
+  if (!drive) return null;
+
+  try {
+    const response = await drive.files.update({
+      fileId: folderId,
+      requestBody: { name: orderId },
+      fields: 'id,name,webViewLink',
+      supportsAllDrives: true,
+    });
+    return response.data.webViewLink || null;
+  } catch (error) {
+    console.warn(`⚠️ [Drive] No se pudo renombrar la carpeta ${folderId}:`, error.message);
+    return null;
+  }
+}
+
 /**
  * Sube un buffer de archivo (foto, documento, referencia) a una carpeta de Google Drive.
  */

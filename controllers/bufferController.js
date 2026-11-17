@@ -4,7 +4,7 @@ import { fileURLToPath } from 'url';
 import { query } from '../config/db.js';
 import { transcribeAudio } from '../services/whisperService.js';
 import { extractOrderDetails, validatePaymentReceipt, detectFeedbackOrAdjustment, assignDesignAssetsToProducts } from '../services/geminiService.js';
-import { createOrderFolder, getFolderIdFromUrl, uploadBase64ToFolder, getFinalDeliverables } from '../services/driveService.js';
+import { createOrderFolder, getFolderIdFromUrl, uploadBase64ToFolder, getFinalDeliverables, renameOrderFolder } from '../services/driveService.js';
 import { sendWhatsAppWithDelay } from '../services/whatsappTransport.js';
 import { getActiveBotRulesContext, notifyNewOrderBatch } from '../services/telegramControlService.js';
 
@@ -14,12 +14,47 @@ const POLICY_IMAGE_PATH = path.join(__dirname, '../assets/politicas-servicio.jpg
 const QUOTE_SESSION_TTL_MS = 45 * 60 * 1000;
 const quoteSessions = new Map();
 const quoteAssets = new Map();
+const ORDER_ID_PREFIX = 'NG-';
 
 // Ventana de silencio para debouncing (10 segundos de inactividad agrupan ráfagas de mensajes)
 const DEBOUNCE_SECONDS = 10;
 const FREE_CLIENT_CHANGES = 3;
 const EXTRA_CHANGE_PRICE = 2000;
 let financialColumnsReady = null;
+
+function getOrderSequenceNumber(orderId) {
+  const match = String(orderId || '').match(/^NG-(\d+)$/i);
+  return match ? Number(match[1]) : 0;
+}
+
+/**
+ * El panel web (Supabase) y el bot (Neon) guardan copias del mismo pedido.
+ * El consecutivo se reserva tomando el mayor de ambas fuentes: así una orden
+ * creada manualmente en el panel nunca puede ser reemplazada por una del bot.
+ */
+async function getNextSynchronizedOrderId() {
+  const localResult = await query(
+    `SELECT COALESCE(MAX(NULLIF(regexp_replace(id, '[^0-9]', '', 'g'), '')::int), 0) AS max_id
+       FROM orders WHERE id LIKE 'NG-%'`
+  );
+  const localMax = Number(localResult.rows[0]?.max_id || 0);
+
+  const supabaseUrl = process.env.SUPABASE_URL || 'https://ygpfvmevizoetnvsxsqu.supabase.co';
+  const supabaseKey = process.env.SUPABASE_ANON_KEY || 'sb_publishable_f3fibrFoyyjwmAQ1rX1X-Q_UVS3nQtm';
+  const remoteResponse = await fetch(
+    `${supabaseUrl}/rest/v1/orders?select=id&id=like.NG-*&order=id.desc&limit=1`,
+    { headers: { apikey: supabaseKey, Authorization: `Bearer ${supabaseKey}` } }
+  );
+
+  if (!remoteResponse.ok) {
+    throw new Error(`No se pudo verificar el consecutivo del panel (${remoteResponse.status})`);
+  }
+
+  const remoteRows = await remoteResponse.json();
+  const remoteMax = getOrderSequenceNumber(remoteRows?.[0]?.id);
+  const next = Math.max(localMax, remoteMax) + 1;
+  return `${ORDER_ID_PREFIX}${String(next).padStart(4, '0')}`;
+}
 
 /** Campos separados para conservar el valor original y sumar ajustes sin ambigüedad. */
 async function ensureFinancialColumns() {
@@ -88,10 +123,11 @@ async function uploadDesignAssetsForOrder(order, assets) {
   let folderId = getFolderIdFromUrl(order.drive_url) || order.driveFolderId;
   let driveUrl = order.drive_url || order.driveFolderUrl || '';
   if (!folderId) {
-    driveUrl = await createOrderFolder(`[${order.id}] - ${order.tipoDiseno || 'Diseño'} - ${order.cliente || 'Cliente'}`);
+    driveUrl = await createOrderFolder(order.id);
     folderId = getFolderIdFromUrl(driveUrl);
   }
   if (!folderId) throw new Error(`No se pudo obtener una carpeta válida de Drive para ${order.id}`);
+  await renameOrderFolder(folderId, order.id);
 
   const uploaded = [];
   for (const [index, asset] of designAssets.entries()) {
@@ -179,13 +215,14 @@ export async function deliverFinalFilesIfReady({ orderId, phone }) {
   // La carpeta se entrega siempre. Si por alguna razón todavía no existe, se
   // crea antes de responder para que el cliente tenga un único enlace estable.
   if (!deliveryDriveUrl) {
-    deliveryDriveUrl = await createOrderFolder(`[${orderId}] - Entrega - ${order.tipoDiseno || 'Diseño'}`);
+    deliveryDriveUrl = await createOrderFolder(orderId);
     deliveryFolderId = getFolderIdFromUrl(deliveryDriveUrl);
     await query(
       `UPDATE orders SET drive_url = $1, "driveFolderUrl" = $1, "driveFolderId" = $2, updated_at = NOW() WHERE id = $3`,
       [deliveryDriveUrl, deliveryFolderId || null, orderId]
     );
   }
+  if (deliveryFolderId) await renameOrderFolder(deliveryFolderId, orderId);
 
   const deliverables = await getFinalDeliverables(deliveryFolderId);
   if (!deliverables.pdf.length || !deliverables.editable.length) {
@@ -902,20 +939,7 @@ async function handleCustomerBuffer(phone, messages) {
           const parsedData = await extractOrderDetails(combinedText);
           const totalAmount = Number(parsedData?.montoTotalCalculado) || Number(paymentAnalysis.montoDetectado) || 0;
 
-          let orderId;
-          try {
-            const rpcRes = await query(`SELECT get_next_order_id() AS next_id`);
-            orderId = rpcRes.rows[0].next_id;
-          } catch (e) {
-            // Fallback consistente: mayor NG-#### existente + 1 (nomenclatura secuencial)
-            try {
-              const maxRes = await query(`SELECT COALESCE(MAX(NULLIF(regexp_replace(id, '[^0-9]', '', 'g'), '')::int), 0) + 1 AS next_num FROM orders WHERE id LIKE 'NG-%'`);
-              const n = Number(maxRes.rows[0] && maxRes.rows[0].next_num) || 1;
-              orderId = 'NG-' + String(n).padStart(4, '0');
-            } catch (e2) {
-              orderId = `NG-${Date.now().toString().slice(-4)}`;
-            }
-          }
+          const orderId = await getNextSynchronizedOrderId();
 
           const todayStr = new Date().toISOString().split('T')[0];
           const valorNum = totalAmount;
@@ -929,10 +953,9 @@ async function handleCustomerBuffer(phone, messages) {
           const clientName = parsedData?.nombreCliente || registeredClient?.name || 'Cliente WhatsApp';
 
           // 1. Crear subcarpeta en Google Drive para el pedido
-          const folderName = `[${orderId}] - ${tipoDisenoPrincipal} - ${clientName}`;
           let driveUrl = null;
           try {
-            driveUrl = await createOrderFolder(folderName);
+            driveUrl = await createOrderFolder(orderId);
           } catch (dErr) {
             console.warn('⚠️ Error al crear carpeta de Drive:', dErr.message);
           }
@@ -1473,28 +1496,14 @@ async function handleCustomerBuffer(phone, messages) {
     const assetAssignments = await assignDesignAssetsToProducts(parsedData.productos, pendingAssets);
 
     for (const [productIndex, prod] of parsedData.productos.entries()) {
-      let orderId;
-      try {
-        const rpcRes = await query(`SELECT get_next_order_id() AS next_id`);
-        orderId = rpcRes.rows[0].next_id;
-      } catch (e) {
-        // Fallback consistente: mayor NG-#### existente + 1 (nomenclatura secuencial)
-        try {
-          const maxRes = await query(`SELECT COALESCE(MAX(NULLIF(regexp_replace(id, '[^0-9]', '', 'g'), '')::int), 0) + 1 AS next_num FROM orders WHERE id LIKE 'NG-%'`);
-          const n = Number(maxRes.rows[0] && maxRes.rows[0].next_num) || 1;
-          orderId = 'NG-' + String(n).padStart(4, '0');
-        } catch (e2) {
-          orderId = `NG-${Date.now().toString().slice(-4)}`;
-        }
-      }
+      const orderId = await getNextSynchronizedOrderId();
 
       const clientName = parsedData.nombreCliente || registeredClient?.name || 'Cliente WhatsApp';
 
       // 1. Crear subcarpeta automáticamente en Google Drive dentro de 'Diseños - Nextal Graphic'
-      const folderName = `[${orderId}] - ${prod.tipoDiseno || 'Diseño'} - ${clientName}`;
       let driveUrl = null;
       try {
-        driveUrl = await createOrderFolder(folderName);
+        driveUrl = await createOrderFolder(orderId);
       } catch (dErr) {
         console.warn('⚠️ Error al crear carpeta de Drive:', dErr.message);
       }
@@ -1504,8 +1513,8 @@ async function handleCustomerBuffer(phone, messages) {
       const effectiveDriveUrl = effectiveFolderId ? driveUrl : null;
 
       // 2. Subir insumos/imágenes adjuntas a Supabase Storage y a la carpeta de Google Drive
-      const supabaseUrl = process.env.SUPABASE_URL || 'https://ygpfvmevizoetnvsxsqu.supabase.co';
       const uploadedDesignAssets = [];
+      const uploadedDriveAssets = [];
       let detectedReceiptUrl = null;
 
       // Adjuntos que la IA relacionó con este producto, no con los demás pedidos del lote.
@@ -1548,17 +1557,18 @@ async function handleCustomerBuffer(phone, messages) {
           // Si es insumo/referencia legítima para el diseño:
           const fileName = `${orderId}_insumo_${designAssetIdx}.${ext}`;
 
-          // Subir a Supabase Storage para miniatura y visualización en el panel
-          const publicUrl = await uploadBase64ToSupabaseStorage(orderId, fileName, asset.media_url);
-          if (publicUrl) {
-            uploadedDesignAssets.push({ name: fileName, url: publicUrl });
+          // Drive es el destino obligatorio de los insumos. No anunciamos un
+          // archivo como registrado hasta que Drive confirme su carga.
+          if (!effectiveFolderId) {
+            throw new Error(`No se creó una carpeta válida de Drive para ${orderId}`);
           }
+          const driveFileUrl = await uploadBase64ToFolder(effectiveFolderId, fileName, asset.media_url);
+          if (!driveFileUrl) throw new Error(`Drive no confirmó la carga de ${fileName}`);
+          uploadedDriveAssets.push({ name: fileName, url: driveFileUrl });
 
-          // Subir a la carpeta de Google Drive del pedido (exclusivo para diseñadores)
-          if (effectiveFolderId) {
-            const driveFileUrl = await uploadBase64ToFolder(effectiveFolderId, fileName, asset.media_url);
-            if (!driveFileUrl) throw new Error(`Drive no confirmó la carga de ${fileName}`);
-          }
+          // Copia adicional para miniatura y visualización desde el panel.
+          const publicUrl = await uploadBase64ToSupabaseStorage(orderId, fileName, asset.media_url);
+          uploadedDesignAssets.push({ name: fileName, url: publicUrl || driveFileUrl });
 
           designAssetIdx++;
         } catch (upErr) {
@@ -1566,7 +1576,7 @@ async function handleCustomerBuffer(phone, messages) {
         }
       }
 
-      const hasUploadedAssets = uploadedDesignAssets.length > 0;
+      const hasUploadedAssets = uploadedDriveAssets.length > 0;
       const primaryRef = hasUploadedAssets ? uploadedDesignAssets[0].url : effectiveDriveUrl;
 
       // NOTAS LIMPIAS DEL PEDIDO (Sin el chat de WhatsApp ni voleo de texto)
@@ -1855,9 +1865,7 @@ async function activateOrderAfterPayment({ order, paymentAnalysis, clientPhones,
 
   if (!folderId || folderId.includes('my-drive') || !effectiveDriveUrl || !effectiveDriveUrl.includes('drive.google.com')) {
     try {
-      const clientLabel = order.cliente || 'Cliente';
-      const folderName = `[${order.id}] - ${order.tipoDiseno || 'Diseño'} - ${clientLabel}`;
-      const createdUrl = await createOrderFolder(folderName);
+      const createdUrl = await createOrderFolder(order.id);
       if (createdUrl && createdUrl.includes('drive.google.com')) {
         effectiveDriveUrl = createdUrl;
         folderId = getFolderIdFromUrl(createdUrl);
@@ -1866,6 +1874,7 @@ async function activateOrderAfterPayment({ order, paymentAnalysis, clientPhones,
       console.warn('⚠️ Error al obtener o crear carpeta de Drive en activación:', createErr.message);
     }
   }
+  if (folderId) await renameOrderFolder(folderId, order.id);
 
   const uploadedFiles = [];
   const clientLinks = [];
