@@ -940,7 +940,9 @@ async function handleCustomerBuffer(phone, messages) {
         }
       }
 
-      if (paymentAnalysis && paymentAnalysis.esComprobanteValido) {
+      // Si el mismo lote trae una solicitud comercial nueva, esa intención
+      // prevalece sobre un comprobante viejo que hubiese quedado pendiente.
+      if (paymentAnalysis && paymentAnalysis.esComprobanteValido && !startsNewCommercialFlow) {
         // CASO 2.1: Comprobante de pago legítimo
         console.log(`✅ [VISION] ¡Comprobante bancario VÁLIDO detectado para ${phone}! Banco: ${paymentAnalysis.banco}, Monto: $${paymentAnalysis.montoDetectado}`);
 
@@ -1474,7 +1476,11 @@ async function handleCustomerBuffer(phone, messages) {
     const hasNonTextInput = messages.some(message =>
       ['image', 'document', 'audio'].includes(message.message_type)
     );
-    const incomingDesignAssets = messages.filter(isDesignAsset);
+    // Un comprobante previo no es un insumo del diseño nuevo. De este modo no
+    // se adjunta por error al pedido que el cliente acaba de solicitar.
+    const incomingDesignAssets = messages.filter(message =>
+      isDesignAsset(message) && message.id !== validReceiptMessage?.id
+    );
     const rememberedDesignAssets = incomingDesignAssets.length > 0
       ? rememberQuoteAssets(phone, incomingDesignAssets)
       : getRememberedQuoteAssets(phone);
@@ -1564,7 +1570,9 @@ async function handleCustomerBuffer(phone, messages) {
 
   if (!parsedData) {
     const rulesContext = await getActiveBotRulesContext();
-    const quoteInput = hasNonTextInput ? combinedText : currentText;
+    // La petición nueva se interpreta con su texto actual, no con el
+    // comprobante o contexto de un pedido anterior que esté en el búfer.
+    const quoteInput = isNewRequest ? currentText : (hasNonTextInput ? combinedText : currentText);
     const aiContext = rulesContext
       ? `${quoteInput}\n\n[REGLAS OPERATIVAS DEFINIDAS POR EL ADMIN]\n${rulesContext}`
       : quoteInput;
