@@ -3,7 +3,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { query } from '../config/db.js';
 import { transcribeAudio } from '../services/whisperService.js';
-import { extractOrderDetails, validatePaymentReceipt, detectFeedbackOrAdjustment, assignDesignAssetsToProducts } from '../services/geminiService.js';
+import { extractOrderDetails, validatePaymentReceipt, detectFeedbackOrAdjustment, assignDesignAssetsToProducts, extractDesignReferenceBrief } from '../services/geminiService.js';
 import { createOrderFolder, getFolderIdFromUrl, uploadBase64ToFolder, getFinalDeliverables, renameOrderFolder } from '../services/driveService.js';
 import { sendWhatsAppWithDelay } from '../services/whatsappTransport.js';
 import { getActiveBotRulesContext, notifyNewOrderBatch, requestHumanIntervention, resolveHumanIntervention } from '../services/telegramControlService.js';
@@ -1760,6 +1760,7 @@ async function handleCustomerBuffer(phone, messages) {
       incomingDesignAssets
     );
     const assetAssignments = await assignDesignAssetsToProducts(parsedData.productos, pendingAssets);
+    const referenceBrief = await extractDesignReferenceBrief(pendingAssets);
 
     for (const [productIndex, prod] of parsedData.productos.entries()) {
       const orderId = await getNextSynchronizedOrderId();
@@ -1785,7 +1786,8 @@ async function handleCustomerBuffer(phone, messages) {
 
       // Adjuntos que la IA relacionó con este producto, no con los demás pedidos del lote.
       const productAssets = assetAssignments
-        .filter(item => item.productIndex === productIndex)
+        .filter(item => item.productIndex === productIndex ||
+          (parsedData.productos.length === 1 && item.productIndex === -1))
         .map(item => pendingAssets[item.assetIndex])
         .filter(Boolean);
       
@@ -1846,7 +1848,11 @@ async function handleCustomerBuffer(phone, messages) {
       const primaryRef = hasUploadedAssets ? uploadedDesignAssets[0].url : effectiveDriveUrl;
 
       // NOTAS LIMPIAS DEL PEDIDO (Sin el chat de WhatsApp ni voleo de texto)
-      const notasStr = prod.notasDiseno || prod.descripcionDetallada || 'Sin especificaciones adicionales';
+      const notasStr = [
+        prod.notasDiseno,
+        prod.descripcionDetallada,
+        referenceBrief ? `Insumos y referencias visuales:\n${referenceBrief}` : ''
+      ].filter((value, index, all) => value && all.indexOf(value) === index).join('\n\n') || 'Sin especificaciones adicionales';
       // Rastreo consume este campo directamente; nunca mezclar enlaces, pagos o medidas.
       const orderNotes = notasStr;
 
@@ -1911,7 +1917,9 @@ async function handleCustomerBuffer(phone, messages) {
         id: orderId,
         tipoDiseno: tipoDisenoConTinta,
         precio: precioProd,
-        descripcion: prod.descripcionDetallada || ''
+        descripcion: prod.descripcionDetallada || '',
+        expectedAssets: productAssets.length,
+        uploadedAssets: uploadedDriveAssets.length
       });
       await syncOrderToSupabase(orderId);
     }
@@ -1945,10 +1953,15 @@ async function handleCustomerBuffer(phone, messages) {
 
     // Incluye los insumos enviados antes de cotizar, elegir opción o confirmar.
     const attachedAssets = pendingAssets;
-    const hasAssets = attachedAssets.length > 0;
+    const expectedAssetCount = createdOrderItems.reduce((sum, item) => sum + Number(item.expectedAssets || 0), 0);
+    const uploadedAssetCount = createdOrderItems.reduce((sum, item) => sum + Number(item.uploadedAssets || 0), 0);
+    const hasAssets = expectedAssetCount > 0;
+    const allAssetsUploaded = !hasAssets || uploadedAssetCount === expectedAssetCount;
 
-    const assetsNotice = hasAssets
-      ? `📁 *Insumos registrados:* recibimos ${attachedAssets.length} archivo(s) o imagen(es) y ya quedaron vinculados a este pedido.`
+    const assetsNotice = hasAssets && allAssetsUploaded
+      ? `📁 *Insumos registrados:* recibimos ${uploadedAssetCount} archivo(s) o imagen(es) y ya quedaron vinculados a este pedido.`
+      : hasAssets
+        ? `⚠️ *Carga pendiente:* recibimos ${expectedAssetCount} archivo(s), pero Drive confirmó ${uploadedAssetCount}. No iniciaremos producción hasta completar la carga; te avisaremos para reenviar solo los archivos faltantes.`
       : '📎 *Insumos pendientes:* envíanos por este chat los archivos, imágenes, textos, logos, datos y referencias necesarios. Los vincularemos a este pedido.';
 
     const orderIdsHeader = createdOrderItems.map(o => o.id).join(', ');

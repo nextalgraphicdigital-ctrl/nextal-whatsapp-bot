@@ -302,6 +302,42 @@ export async function assignDesignAssetsToProducts(products, assets) {
   return fallback();
 }
 
+/** Resume textos, colores y referencias visibles para que el diseñador no
+ * tenga que abrir cada imagen para entender el encargo. */
+export async function extractDesignReferenceBrief(assets) {
+  const safeAssets = (assets || []).filter(asset =>
+    ['image', 'document'].includes(asset?.message_type) &&
+    typeof asset?.media_url === 'string' && asset.media_url.startsWith('data:')
+  ).slice(0, 6);
+  const captions = safeAssets.map(asset => String(asset.content || '').trim()).filter(Boolean);
+  if (!safeAssets.length) return captions.join(' | ');
+
+  const apiKey = getGeminiApiKey();
+  if (!apiKey) return captions.join(' | ');
+
+  const parts = [{
+    text: 'Resume los insumos visuales de un pedido de diseño gráfico en español. Extrae solo información útil para el diseñador: textos visibles, marca/logo, colores, estilo, medidas o composición solicitada. Máximo 5 viñetas breves. No inventes datos; si no se aprecia, omítelo.'
+  }];
+  safeAssets.forEach((asset, index) => {
+    const match = asset.media_url.match(/^data:([^;]+);base64,(.+)$/s);
+    parts.push({ text: `REFERENCIA ${index + 1}. Leyenda del cliente: ${asset.content || 'Sin leyenda'}` });
+    if (match) parts.push({ inlineData: { mimeType: match[1], data: match[2] } });
+  });
+
+  try {
+    const ai = new GoogleGenAI({ apiKey });
+    const response = await callGeminiWithRetry(() => ai.models.generateContent({
+      model: 'gemini-3.5-flash-lite',
+      contents: [{ role: 'user', parts }],
+      config: { temperature: 0.1 }
+    }), 1, 1000);
+    return String(response.text || '').trim().slice(0, 1800) || captions.join(' | ');
+  } catch (error) {
+    console.warn(`⚠️ [IA INSUMOS] No se pudo resumir referencias: ${error.message}`);
+    return captions.join(' | ');
+  }
+}
+
 /**
  * Analiza de forma multimodal una imagen (comprobante de pago bancario)
  * con la capacidad de visión de Gemini y protección ante error 429.

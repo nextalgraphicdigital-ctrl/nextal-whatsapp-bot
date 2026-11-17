@@ -39,7 +39,15 @@ export async function uploadBase64ToFolder(folderId, fileName, dataUri) {
     }
     const mimeType = matches[1];
     const buffer = Buffer.from(matches[2], 'base64');
-    return await uploadFileToFolder(folderId, fileName, mimeType, buffer);
+    // Drive puede responder transitoriamente con error de red/cuota. Antes de
+    // declarar un archivo perdido se intenta tres veces y solo se confirma al
+    // recibir la URL creada por Drive.
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      const uploaded = await uploadFileToFolder(folderId, fileName, mimeType, buffer);
+      if (uploaded) return uploaded;
+      if (attempt < 3) await new Promise(resolve => setTimeout(resolve, attempt * 800));
+    }
+    return null;
   } catch (e) {
     console.error(`❌ [Drive] Error subiendo ${fileName}:`, e.message);
     return null;
