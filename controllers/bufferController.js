@@ -6,7 +6,7 @@ import { transcribeAudio } from '../services/whisperService.js';
 import { extractOrderDetails, validatePaymentReceipt, detectFeedbackOrAdjustment, assignDesignAssetsToProducts } from '../services/geminiService.js';
 import { createOrderFolder, getFolderIdFromUrl, uploadBase64ToFolder, getFinalDeliverables, renameOrderFolder } from '../services/driveService.js';
 import { sendWhatsAppWithDelay } from '../services/whatsappTransport.js';
-import { getActiveBotRulesContext, notifyNewOrderBatch, requestHumanIntervention } from '../services/telegramControlService.js';
+import { getActiveBotRulesContext, notifyNewOrderBatch, requestHumanIntervention, resolveHumanIntervention } from '../services/telegramControlService.js';
 import { findOrderForReply } from '../services/orderMessageLinkService.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -40,6 +40,15 @@ function findMentionedActiveOrder(text, orders) {
 
 function hasMultiplePaymentGroups(orders) {
   return new Set((orders || []).map(order => order.invoice_id || order.id)).size > 1;
+}
+
+function clearOrderRoutingState(phone) {
+  for (const key of orderRoutingPrompts.keys()) {
+    if (key.startsWith(`${phone}:`)) orderRoutingPrompts.delete(key);
+  }
+  for (const key of orderRoutingPromptedBatches) {
+    if (key.startsWith(`${phone}:`)) orderRoutingPromptedBatches.delete(key);
+  }
 }
 
 async function requestOrderSelection(phone, orders, action, bufferIds = []) {
@@ -830,9 +839,33 @@ async function handleCustomerBuffer(phone, messages) {
       quoteProducts(activeQuoteSession.data).length > 0
     ));
     const isNewRequest = isNewCommercialRequest(currentTextForIntent);
+    const startsNewCommercialFlow = isGreetingOnly(currentTextForIntent) || isNewRequest;
+    // Un saludo o una cotización nueva tiene prioridad total sobre pedidos
+    // anteriores. También cierra cualquier aclaración pendiente de una
+    // conversación vieja para que no escale por error al equipo humano.
+    if (startsNewCommercialFlow) {
+      clearOrderRoutingState(phone);
+      try {
+        await resolveHumanIntervention(phone);
+      } catch (error) {
+        console.warn('⚠️ No se pudo cerrar el enrutamiento anterior:', error.message);
+      }
+    }
     if (explicitlyMentionedOrder) activeOrder = explicitlyMentionedOrder;
     else if (replyLinkedOrder) activeOrder = replyLinkedOrder;
     const hasResolvedOrderReference = Boolean(explicitlyMentionedOrder || replyLinkedOrder);
+
+    // Un saludo aislado nunca se interpreta como cambio, pago ni como un
+    // archivo pendiente de otro pedido: se responde y se termina este lote.
+    if (!hasNonTextInputForIntent && isGreetingOnly(currentTextForIntent)) {
+      await sendWhatsAppWithDelay(
+        phone,
+        '¡Hola! 👋 Bienvenido a Nextal Graphic, tu aliado creativo del sector publicitario.\n¿En qué podemos ayudarte hoy?'
+      );
+      await markBufferProcessed(bufferIds);
+      return;
+    }
+
     const isReviewAwaitingResponse = activeOrder && ['revision_cliente', 'cambios_solicitados'].includes(activeOrder.qc_status);
     if (!hasNonTextInputForIntent && isReviewAwaitingResponse && isDirectApproval(currentTextForIntent)) {
       if (activeOrders.length > 1 && !hasResolvedOrderReference) {
@@ -1197,7 +1230,9 @@ async function handleCustomerBuffer(phone, messages) {
     // CASO: CLIENTE RESPONDE CAMBIOS, AJUSTES O APROBACIÓN DE UN DISEÑO
     // (Funciona incluso si el cliente contesta 2 días después de recibir la muestra)
     // =========================================================================
-    let targetOrderForFeedback = activeOrder;
+    // Una cotización nueva no puede convertirse en comentario de un pedido
+    // anterior, aunque el cliente tenga varios pedidos activos en el chat.
+    let targetOrderForFeedback = startsNewCommercialFlow ? null : activeOrder;
     const hasCreativeAttachments = messages.some(message =>
       ['image', 'document', 'audio'].includes(message.message_type)
     );
@@ -1207,7 +1242,7 @@ async function handleCustomerBuffer(phone, messages) {
       await requestOrderSelection(phone, activeOrders, 'tus archivos, indicaciones o cambios', bufferIds);
       return;
     }
-    if (!targetOrderForFeedback) {
+    if (!startsNewCommercialFlow && !targetOrderForFeedback) {
       try {
         const recentOrderRes = await query(
           `SELECT id, "tipoDiseno", valor, estado, qc_status, notes, drive_url, "driveFolderId", "driveFolderUrl", created_at

@@ -96,6 +96,22 @@ export async function requestHumanIntervention({ phone, orderId = null, summary 
   return { escalated: true, attempts };
 }
 
+/**
+ * Cierra una intervención pendiente cuando el cliente inicia una cotización
+ * nueva. Así un intento de aclaración de un pedido anterior no contamina una
+ * conversación comercial distinta ni provoca una escalada indebida.
+ */
+export async function resolveHumanIntervention(phone) {
+  if (!phone) return;
+  await ensureTelegramTables();
+  await query(
+    `UPDATE bot_handoffs
+        SET status = 'resolved', resolved_at = NOW()
+      WHERE phone = $1 AND status = 'open'`,
+    [phone]
+  );
+}
+
 /** Avisa al administrador apenas entra una nueva solicitud para asignación. */
 export async function notifyNewOrderBatch({ clientName, phone, items, total, invoiceId }) {
   if (!enabled()) return;
