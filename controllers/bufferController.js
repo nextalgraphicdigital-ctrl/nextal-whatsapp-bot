@@ -13,6 +13,7 @@ const __dirname = path.dirname(__filename);
 const POLICY_IMAGE_PATH = path.join(__dirname, '../assets/politicas-servicio.jpg');
 const QUOTE_SESSION_TTL_MS = 45 * 60 * 1000;
 const quoteSessions = new Map();
+const quoteAssets = new Map();
 
 // Ventana de silencio para debouncing (10 segundos de inactividad agrupan ráfagas de mensajes)
 const DEBOUNCE_SECONDS = 10;
@@ -397,6 +398,53 @@ function quoteProducts(data) {
   return Array.isArray(data?.productos) ? data.productos.filter(Boolean) : [];
 }
 
+function isDesignAsset(message) {
+  return ['image', 'document'].includes(message?.message_type) &&
+    typeof message?.media_url === 'string' &&
+    message.media_url.startsWith('data:');
+}
+
+function assetIdentity(asset) {
+  return [asset?.id || '', asset?.media_url || '', asset?.message_type || ''].join('|');
+}
+
+function mergeDesignAssets(...groups) {
+  const result = [];
+  const seen = new Set();
+
+  groups.flat().filter(Boolean).forEach(asset => {
+    if (!isDesignAsset(asset)) return;
+    const key = assetIdentity(asset);
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    result.push(asset);
+  });
+
+  return result;
+}
+
+function getRememberedQuoteAssets(phone) {
+  const keys = getQuoteSessionKeys(phone);
+  const record = keys.map(key => quoteAssets.get(key)).find(Boolean);
+  if (!record) return [];
+
+  if (Date.now() - record.updatedAt > QUOTE_SESSION_TTL_MS) {
+    keys.forEach(key => quoteAssets.delete(key));
+    return [];
+  }
+
+  return record.assets || [];
+}
+
+function rememberQuoteAssets(phone, assets) {
+  const record = {
+    assets: mergeDesignAssets(getRememberedQuoteAssets(phone), assets),
+    updatedAt: Date.now()
+  };
+  getQuoteSessionKeys(phone).forEach(key => quoteAssets.set(key, record));
+  return record.assets;
+}
+
 function isAlternativeQuote(data) {
   return String(data?.sonAlternativas).toLowerCase() === 'true' && quoteProducts(data).length > 1;
 }
@@ -421,23 +469,28 @@ function getQuoteSession(phone) {
 
   if (Date.now() - session.updatedAt > QUOTE_SESSION_TTL_MS) {
     keys.forEach(key => quoteSessions.delete(key));
+    keys.forEach(key => quoteAssets.delete(key));
     return null;
   }
   return session;
 }
 
-function saveQuoteSession(phone, data) {
+function saveQuoteSession(phone, data, assets = []) {
+  const previous = getQuoteSession(phone);
   const session = {
     data: cloneQuoteData(data),
-    selectedOptionIndex: null,
+    selectedOptionIndex: previous?.selectedOptionIndex ?? null,
+    assets: mergeDesignAssets(previous?.assets || [], getRememberedQuoteAssets(phone), assets),
     updatedAt: Date.now()
   };
   getQuoteSessionKeys(phone).forEach(key => quoteSessions.set(key, session));
+  rememberQuoteAssets(phone, session.assets);
   return session;
 }
 
 function clearQuoteSession(phone) {
   getQuoteSessionKeys(phone).forEach(key => quoteSessions.delete(key));
+  getQuoteSessionKeys(phone).forEach(key => quoteAssets.delete(key));
 }
 
 function findSelectedOptionIndex(text, optionCount) {
@@ -1231,6 +1284,10 @@ async function handleCustomerBuffer(phone, messages) {
     const hasNonTextInput = messages.some(message =>
       ['image', 'document', 'audio'].includes(message.message_type)
     );
+    const incomingDesignAssets = messages.filter(isDesignAsset);
+    const rememberedDesignAssets = incomingDesignAssets.length > 0
+      ? rememberQuoteAssets(phone, incomingDesignAssets)
+      : getRememberedQuoteAssets(phone);
     if (!hasNonTextInput && isGreetingOnly(currentText)) {
       console.log(`💬 [BUFFER] Saludo aislado de ${phone}; respondiendo sin crear pedido.`);
       await sendWhatsAppWithDelay(
@@ -1243,7 +1300,7 @@ async function handleCustomerBuffer(phone, messages) {
 
   let parsedData = null;
   let confirmedFromQuote = false;
-  const pendingQuote = !hasNonTextInput ? getQuoteSession(phone) : null;
+  const pendingQuote = getQuoteSession(phone);
 
   // Una cotización queda asociada solo a esta conversación durante 45 minutos.
   // Así un "Confirmo el pedido" no crea un pedido viejo o inventado.
@@ -1337,7 +1394,7 @@ async function handleCustomerBuffer(phone, messages) {
     // El historial de las últimas 24 h permite que un “Confirmo el pedido”
     // posterior recupere estos mismos productos sin que el cliente repita todo.
   if (!confirmedFromQuote) {
-    saveQuoteSession(phone, parsedData);
+    saveQuoteSession(phone, parsedData, rememberedDesignAssets);
       console.log(`💬 [COTIZACIÓN] ${phone} consultó ${parsedData.productos.length} producto(s) sin confirmar pedido.`);
       await sendQuoteOnly(phone, parsedData);
       await markBufferProcessed(bufferIds);
@@ -1366,9 +1423,10 @@ async function handleCustomerBuffer(phone, messages) {
 
     const createdOrderItems = [];
     const todayStr = new Date().toISOString().split('T')[0];
-    const pendingAssets = messages.filter(m =>
-      (m.message_type === 'image' || m.message_type === 'document') &&
-      m.media_url && m.media_url.startsWith('data:')
+    const pendingAssets = mergeDesignAssets(
+      pendingQuote?.assets || [],
+      rememberedDesignAssets,
+      incomingDesignAssets
     );
     const assetAssignments = await assignDesignAssetsToProducts(parsedData.productos, pendingAssets);
 
@@ -1567,22 +1625,16 @@ async function handleCustomerBuffer(phone, messages) {
       `• *Bancolombia Ahorros:* 05993698379\n` +
       `• *Nequi / Daviplata:* 3234315008\n\n`;
 
-    // Identificar si el cliente adjuntó imágenes o archivos en este lote
-    const attachedAssets = messages.filter(m => (m.message_type === 'image' || m.message_type === 'document') && m.media_url);
+    // Incluye los insumos enviados antes de cotizar, elegir opción o confirmar.
+    const attachedAssets = pendingAssets;
     const hasAssets = attachedAssets.length > 0;
 
-    const requiredDesignInputs = [
-      '🧩 *Para iniciar el diseño necesitamos:*',
-      '• Texto final y datos de contacto.',
-      '• Logo en buena calidad (PNG, PDF o AI), si aplica.',
-      '• Imágenes o fotos que deban usarse.',
-      '• Referencias de estilo e indicaciones especiales.',
-      '• Medidas finales, si aplican.'
-    ].join('\n');
-
     const assetsNotice = hasAssets
-      ? `📸 Para habilitar el inicio del diseño, envíanos por aquí el comprobante de transferencia.\n\n📁 *Archivos recibidos:* Ya registramos tus insumos o referencias adjuntas. Una vez validado el comprobante, el diseñador los revisará.\n\n${requiredDesignInputs}`
-      : `📸 Para habilitar el inicio del diseño, envíanos por aquí el comprobante de transferencia y los insumos de tu diseño.\n\n${requiredDesignInputs}`;
+      ? `📁 *Insumos registrados:* recibimos ${attachedAssets.length} archivo(s) o imagen(es) y ya quedaron vinculados a este pedido.`
+      : '📎 *Insumos pendientes:* envíanos por este chat los archivos, imágenes, textos, logos, datos y referencias necesarios. Los vincularemos a este pedido.';
+
+    const paymentNotice =
+      '📸 *Siguiente paso:* envíanos una imagen legible del comprobante de transferencia del abono. Validaremos que sea un comprobante bancario y que cubra el abono requerido antes de iniciar el diseño. Si el valor es mayor, se registrará a favor del pedido.';
 
     const orderIdsHeader = createdOrderItems.map(o => o.id).join(', ');
     if (createdOrderItems.length > 0) {
@@ -1595,6 +1647,7 @@ async function handleCustomerBuffer(phone, messages) {
       `📝 *Detalle de Productos:*\n${itemsSummary}\n\n` +
       `${financialSection}` +
       `${assetsNotice}\n\n` +
+      `${paymentNotice}\n\n` +
       `🔗 *¿Aún no te has registrado?* Te invitamos a registrarte en nuestra plataforma oficial:\nhttps://nextal-graphic-interno-2.vercel.app/clientes#`;
 
     // 1. Enviar primero la infografía de políticas de servicio con caption corto
