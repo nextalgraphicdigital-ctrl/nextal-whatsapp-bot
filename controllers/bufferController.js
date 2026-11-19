@@ -796,6 +796,19 @@ async function sendQuotePaymentRequest(phone, quoteSession) {
   const abono = Math.ceil(total * 0.5);
   const productText = products.map(product => `• *${formatQuoteProductName(product)}*`).join('\n');
 
+  // La política se muestra exactamente al pasar de insumos a pago, antes del
+  // resumen y del comprobante. Aún no hay pedido ni ID en este momento.
+  if (fs.existsSync(POLICY_IMAGE_PATH)) {
+    await sendWhatsAppWithDelay(
+      phone,
+      '📢 *¡Gracias por elegirnos!* Antes de iniciar tu pedido, aquí están nuestras políticas de servicio:',
+      POLICY_IMAGE_PATH
+    );
+    await new Promise(resolve => setTimeout(resolve, 1500));
+  } else {
+    console.warn(`⚠️ No se encontró la imagen de políticas: ${POLICY_IMAGE_PATH}`);
+  }
+
   await sendWhatsAppWithDelay(
     phone,
     `📋 *Resumen de tu cotización*\n\n${productText}\n\n` +
