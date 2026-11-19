@@ -41,6 +41,56 @@ async function fetchCatalog() {
   }
 }
 
+function normalizeCatalogText(value = '') {
+  return String(value).toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]/g, '');
+}
+
+// El portal es la fuente de variantes. Cuando el cliente pide un producto
+// sin decir la tinta, se muestran todas las alternativas activas en vez de
+// dejar que el modelo seleccione arbitrariamente una (por ejemplo 4x0).
+async function expandGenericCatalogOptions(parsed, rawText) {
+  const products = Array.isArray(parsed?.productos) ? parsed.productos : [];
+  if (products.length !== 1 || parsed?.sonAlternativas) return parsed;
+
+  try {
+    const catalogRes = await query(`SELECT categoria, variante_tinta, precio FROM services_pricing WHERE activo = true ORDER BY categoria, variante_tinta`);
+    const product = products[0] || {};
+    const expected = normalizeCatalogText(product.tipoDiseno);
+    const matching = (catalogRes.rows || []).filter(item => {
+      const category = normalizeCatalogText(item.categoria);
+      const productFamilies = ['tarjet', 'volant', 'adhesiv', 'pendon', 'aviso', 'logo', 'redibujo', 'sticker', 'etiquet', 'talonar'];
+      const sameFamily = productFamilies.some(family => category.includes(family) && expected.includes(family));
+      return category === expected || category.includes(expected) || expected.includes(category) || sameFamily;
+    });
+    const variants = matching.filter(item => item.variante_tinta && String(item.variante_tinta).toLowerCase() !== 'no aplica');
+    if (variants.length < 2) return parsed;
+
+    const raw = normalizeCatalogText(rawText);
+    const specified = variants.some(item => {
+      const variant = normalizeCatalogText(item.variante_tinta);
+      return variant.length >= 2 && raw.includes(variant);
+    });
+    if (specified) return parsed;
+
+    const options = variants.map(item => ({
+      ...product,
+      tipoDiseno: item.categoria,
+      varianteTinta: item.variante_tinta,
+      precioUnitario: Number(item.precio) || 0
+    }));
+    return {
+      ...parsed,
+      sonAlternativas: true,
+      productos: options,
+      montoTotalCalculado: 0,
+      resumenGeneral: parsed.resumenGeneral || 'Elige la tinta que necesitas para tu diseño.'
+    };
+  } catch (error) {
+    console.warn('⚠️ No se pudieron expandir las variantes del catálogo:', error.message);
+    return parsed;
+  }
+}
+
 /**
  * Ejecuta una llamada a la API de Gemini con manejo robusto de cuota (Error 429 RESOURCE_EXHAUSTED).
  * Aplica reintentos automáticos con pausa exponencial (backoff) y jitter aleatorio.
@@ -142,6 +192,7 @@ REGLAS CONVERSACIONALES:
      * En "notasDiseno": redacta un resumen claro, limpio y conciso de los requerimientos y especificaciones del diseño indicados por el cliente (ej: "Diseño para vitrina de local comercial. Incluir logo de la empresa y lista de servicios publicitarios."). NUNCA incluyas saludos ni el texto completo del chat.
      * En "descripcionDetallada": redacta un resumen técnico completo y minucioso de lo que el cliente indicó para ese diseño (medidas de maquetación digital como 172 cm ancho x 191 cm alto, fotos de referencia, código de barras, insumos enviados al correo, etc.).
 * "montoTotalCalculado": suma exacta únicamente de productos que el cliente quiere juntos. Si "sonAlternativas": true, usa 0.
+   - Si el producto tiene varias tintas o versiones en el catálogo y el cliente NO indicó una concreta, devuelve TODAS como alternativas ("sonAlternativas": true). Nunca elijas por defecto 4x0 ni otra variante. Ejemplo: para "un volante" ofrece 1x0, 2x0, 4x0 y 4x4 con sus precios oficiales.
 
 3. FLUJO DE CLARIFICACIÓN (SOLO CUANDO NO SE TIENE NINGUNA IDEA DE QUÉ SERVICIO REQUIERE):
    - Si el cliente envía una consulta completamente ambigua sin especificar trabajo ni mandar medidas (ej: "hola, cuánto cobran por un trabajo?", "¿qué servicios tienen?"):
@@ -230,7 +281,7 @@ ${rawText}`;
   try {
     const textResponse = response.text;
     const cleanJson = textResponse.replace(/```json/g, '').replace(/```/g, '').trim();
-    return JSON.parse(cleanJson);
+    return await expandGenericCatalogOptions(JSON.parse(cleanJson), rawText);
   } catch (parseErr) {
     console.error('❌ Error parseando JSON de Gemini:', parseErr.message);
     return {
