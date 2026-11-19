@@ -596,6 +596,8 @@ function saveQuoteSession(phone, data, assets = []) {
   const session = {
     data: cloneQuoteData(data),
     selectedOptionIndex: previous?.selectedOptionIndex ?? null,
+    awaitingDesignInputs: Boolean(previous?.awaitingDesignInputs),
+    awaitingPayment: false,
     assets: mergeDesignAssets(previous?.assets || [], getRememberedQuoteAssets(phone), assets),
     updatedAt: Date.now()
   };
@@ -621,6 +623,8 @@ async function ensureQuoteSessionSchema() {
         session_data JSONB NOT NULL,
         selected_option_index INTEGER,
         awaiting_design_inputs BOOLEAN NOT NULL DEFAULT false,
+        awaiting_payment BOOLEAN NOT NULL DEFAULT false,
+        asset_message_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
     `).catch(error => {
@@ -628,6 +632,8 @@ async function ensureQuoteSessionSchema() {
       throw error;
     });
   }
+  await query(`ALTER TABLE whatsapp_quote_sessions ADD COLUMN IF NOT EXISTS awaiting_payment BOOLEAN NOT NULL DEFAULT false`);
+  await query(`ALTER TABLE whatsapp_quote_sessions ADD COLUMN IF NOT EXISTS asset_message_ids JSONB NOT NULL DEFAULT '[]'::jsonb`);
   return quoteSessionSchemaReady;
 }
 
@@ -635,18 +641,22 @@ async function persistQuoteSession(phone, session) {
   try {
     await ensureQuoteSessionSchema();
     await query(
-      `INSERT INTO whatsapp_quote_sessions (phone, session_data, selected_option_index, awaiting_design_inputs, updated_at)
-       VALUES ($1, $2::jsonb, $3, $4, NOW())
+      `INSERT INTO whatsapp_quote_sessions (phone, session_data, selected_option_index, awaiting_design_inputs, awaiting_payment, asset_message_ids, updated_at)
+       VALUES ($1, $2::jsonb, $3, $4, $5, $6::jsonb, NOW())
        ON CONFLICT (phone) DO UPDATE SET
          session_data = EXCLUDED.session_data,
          selected_option_index = EXCLUDED.selected_option_index,
          awaiting_design_inputs = EXCLUDED.awaiting_design_inputs,
+         awaiting_payment = EXCLUDED.awaiting_payment,
+         asset_message_ids = EXCLUDED.asset_message_ids,
          updated_at = NOW()`,
       [
         quoteSessionStorageKey(phone),
         JSON.stringify(session?.data || {}),
         Number.isInteger(session?.selectedOptionIndex) ? session.selectedOptionIndex : null,
-        Boolean(session?.awaitingDesignInputs)
+        Boolean(session?.awaitingDesignInputs),
+        Boolean(session?.awaitingPayment),
+        JSON.stringify((session?.assets || []).map(asset => asset?.id).filter(Boolean))
       ]
     );
   } catch (error) {
@@ -660,7 +670,7 @@ async function restoreQuoteSession(phone) {
   try {
     await ensureQuoteSessionSchema();
     const result = await query(
-      `SELECT session_data, selected_option_index, awaiting_design_inputs, updated_at
+      `SELECT session_data, selected_option_index, awaiting_design_inputs, awaiting_payment, asset_message_ids, updated_at
          FROM whatsapp_quote_sessions
         WHERE phone = $1
         LIMIT 1`,
@@ -676,11 +686,26 @@ async function restoreQuoteSession(phone) {
     }
 
     const data = typeof row.session_data === 'string' ? JSON.parse(row.session_data) : row.session_data;
+    const assetIds = Array.isArray(row.asset_message_ids)
+      ? row.asset_message_ids
+      : JSON.parse(row.asset_message_ids || '[]');
+    let restoredAssets = [];
+    if (assetIds.length) {
+      const assetsRes = await query(
+        `SELECT id, message_type, media_url, content, created_at
+           FROM whatsapp_inbound_buffer
+          WHERE id = ANY($1::bigint[]) AND media_url IS NOT NULL
+          ORDER BY created_at ASC`,
+        [assetIds]
+      );
+      restoredAssets = assetsRes.rows || [];
+    }
     const session = {
       data: cloneQuoteData(data),
       selectedOptionIndex: Number.isInteger(row.selected_option_index) ? row.selected_option_index : null,
       awaitingDesignInputs: Boolean(row.awaiting_design_inputs),
-      assets: [],
+      awaitingPayment: Boolean(row.awaiting_payment),
+      assets: restoredAssets,
       updatedAt
     };
     getQuoteSessionKeys(phone).forEach(key => quoteSessions.set(key, session));
@@ -758,6 +783,28 @@ async function sendSelectedAlternativePrompt(phone, product, index) {
     `✅ Elegiste la opción *${optionLabel(index)}*: *${formatQuoteProductName(product)}* por *$${price} COP*.\n\n` +
     `Para preparar tu diseño, envíanos por este chat los insumos que lleve: *texto final y datos*, logo, imágenes o fotos, referencias de estilo, medidas e indicaciones especiales.\n\n` +
     `Cuando los recibamos, continuaremos automáticamente con tu pedido.`
+  );
+}
+
+// Esta pantalla es solo una cotización con los insumos reunidos: todavía no
+// existe pedido, ID ni carpeta. Esos recursos se crean únicamente al validar
+// el comprobante de pago.
+async function sendQuotePaymentRequest(phone, quoteSession) {
+  const data = selectedQuoteData(quoteSession);
+  const products = quoteProducts(data);
+  const total = Number(data?.montoTotalCalculado || products.reduce((sum, item) => sum + (Number(item.precioUnitario) || 0), 0));
+  const abono = Math.ceil(total * 0.5);
+  const productText = products.map(product => `• *${formatQuoteProductName(product)}*`).join('\n');
+
+  await sendWhatsAppWithDelay(
+    phone,
+    `📋 *Resumen de tu cotización*\n\n${productText}\n\n` +
+    `💰 *Valor total:* $${total.toLocaleString('es-CO')} COP\n` +
+    `💳 *Abono inicial requerido (50%):* $${abono.toLocaleString('es-CO')} COP\n\n` +
+    `🏦 *Cuentas oficiales para transferencia:*\n` +
+    `• Bancolombia Ahorros: 05993698379\n` +
+    `• Nequi / Daviplata: 3234315008\n\n` +
+    `📁 Ya recibimos los insumos que compartiste. Envía por este chat la imagen legible del comprobante para validar el abono. *El pedido se registrará y recibirá su ID cuando el pago sea verificado.*`
   );
 }
 
@@ -948,6 +995,9 @@ async function handleCustomerBuffer(phone, messages) {
     // reiniciado entre la cotización y el envío de los insumos.
     await restoreQuoteSession(phone);
     const activeQuoteSession = getQuoteSession(phone);
+    // Una cotización que espera comprobante siempre tiene prioridad sobre
+    // pedidos anteriores del mismo número: el pago debe crear ESTA solicitud.
+    const quoteAwaitingPayment = activeQuoteSession?.awaitingPayment ? activeQuoteSession : null;
     const isNewQuoteInProgress = Boolean(activeQuoteSession && (
       activeQuoteSession.awaitingDesignInputs ||
       Number.isInteger(activeQuoteSession.selectedOptionIndex) ||
@@ -1041,7 +1091,7 @@ async function handleCustomerBuffer(phone, messages) {
 
         // Si el comprobante llegó inmediatamente después de un pedido recién
         // creado, ese pedido tiene prioridad sobre órdenes antiguas del chat.
-        const recentPaymentOrder = !hasResolvedOrderReference
+        const recentPaymentOrder = !quoteAwaitingPayment && !hasResolvedOrderReference
           ? findRecentPaymentOrder(activeOrders)
           : null;
         if (recentPaymentOrder) {
@@ -1054,10 +1104,12 @@ async function handleCustomerBuffer(phone, messages) {
           }
         }
 
-        if (!recentPaymentOrder && activeOrders.length > 1 && hasMultiplePaymentGroups(activeOrders) && !hasResolvedOrderReference) {
+        if (!quoteAwaitingPayment && !recentPaymentOrder && activeOrders.length > 1 && hasMultiplePaymentGroups(activeOrders) && !hasResolvedOrderReference) {
           await requestOrderSelection(phone, activeOrders, 'este comprobante de pago', bufferIds);
           return;
         }
+
+        if (quoteAwaitingPayment) activeOrder = null;
 
         if (activeOrder) {
           // 1. Subir la captura del comprobante bancario a Supabase Storage
@@ -1164,7 +1216,7 @@ async function handleCustomerBuffer(phone, messages) {
             `🏦 *Entidad:* ${paymentAnalysis.banco || 'Transferencia Bancaria'}\n` +
             `💰 *Pago recibido:* $${paymentNow.toLocaleString('es-CO')} COP\n` +
             `💳 *Acumulado de la solicitud:* $${groupPaid.toLocaleString('es-CO')} de $${groupTotal.toLocaleString('es-CO')} COP\n` +
-            `🔖 *Referencia:* ${paymentAnalysis.numeroReferencia || 'Confirmada'}\n\n` +
+            `\n` +
             `✅ El pago fue aplicado proporcionalmente a cada diseño de esta solicitud.` + trackingMsg;
           await sendWhatsAppWithDelay(phone, successMsg);
 
@@ -1174,8 +1226,20 @@ async function handleCustomerBuffer(phone, messages) {
           return;
         } else {
           // Si no había pedido previo pero envió el comprobante, creamos el pedido ya abonado
-          const parsedData = await extractOrderDetails(combinedText);
+          const parsedData = quoteAwaitingPayment
+            ? selectedQuoteData(quoteAwaitingPayment)
+            : await extractOrderDetails(combinedText);
           const totalAmount = Number(parsedData?.montoTotalCalculado) || Number(paymentAnalysis.montoDetectado) || 0;
+
+          const requiredDeposit = quoteAwaitingPayment ? Math.ceil(totalAmount * 0.5) : 0;
+          if (quoteAwaitingPayment && Number(paymentAnalysis.montoDetectado || 0) < requiredDeposit) {
+            await markBufferProcessed(bufferIds);
+            await sendWhatsAppWithDelay(
+              phone,
+              `⚠️ El comprobante indica $${Number(paymentAnalysis.montoDetectado || 0).toLocaleString('es-CO')} COP. Para registrar tu pedido necesitamos que el abono cubra al menos el 50%: *$${requiredDeposit.toLocaleString('es-CO')} COP*. Puedes enviar el comprobante corregido por este chat.`
+            );
+            return;
+          }
 
           const orderId = await getNextSynchronizedOrderId();
 
@@ -1216,9 +1280,16 @@ async function handleCustomerBuffer(phone, messages) {
             }
           }
 
+          const quoteAssetsForOrder = quoteAwaitingPayment?.assets || [];
+          const referenceBrief = quoteAssetsForOrder.length
+            ? await extractDesignReferenceBrief(quoteAssetsForOrder)
+            : '';
           const notasStr = prodPrincipal.notasDiseno || prodPrincipal.descripcionDetallada || 'Sin notas adicionales';
           // `notes` se muestra al cliente en Rastreo: solo conserva instrucciones creativas.
-          const orderNotes = notasStr;
+          const orderNotes = [
+            notasStr,
+            referenceBrief ? `Insumos y referencias visuales:\n${referenceBrief}` : ''
+          ].filter(Boolean).join('\n\n');
 
           const costoDisenadorNum = Math.round(valorNum * 0.4);
           const utilidadNum = valorNum - costoDisenadorNum;
@@ -1233,7 +1304,7 @@ async function handleCustomerBuffer(phone, messages) {
             ) VALUES (
               $1, $2, $3, $4, $5, $6, $7, 'WhatsApp Bot', $8,
               $9, $10, $11, $12, 'Abonado', 'pendiente_diseno', $13, $14, $15, $14,
-              TRUE, $16, 'whatsapp', $17, NOW(),
+              FALSE, $16, 'whatsapp', $17, NOW(),
               $18, 0, $19, $20, 'Pendiente', 'Pendiente',
               $21, 'Confirmado'
             )`,
@@ -1266,8 +1337,11 @@ async function handleCustomerBuffer(phone, messages) {
 
           // ── ACTIVACIÓN COMPLETA DEL PEDIDO (caso sin pedido previo) ──────────
           try {
-            const newOrderRes = await query(`SELECT id, "tipoDiseno", valor, drive_url, cliente FROM orders WHERE id = $1`, [orderId]);
+            const newOrderRes = await query(`SELECT id, "tipoDiseno", valor, drive_url, "driveFolderId", "driveFolderUrl", cliente FROM orders WHERE id = $1`, [orderId]);
             if (newOrderRes.rows[0]) {
+              if (quoteAssetsForOrder.length) {
+                await uploadDesignAssetsForOrder(newOrderRes.rows[0], quoteAssetsForOrder);
+              }
               await activateOrderAfterPayment({
                 order: newOrderRes.rows[0],
                 paymentAnalysis,
@@ -1283,6 +1357,11 @@ async function handleCustomerBuffer(phone, messages) {
             console.warn('⚠️ [ACTIVAR] No se pudo activar el pedido nuevo:', actErr.message);
           }
           // ─────────────────────────────────────────────────────────────────────
+
+          if (quoteAwaitingPayment) {
+            clearQuoteSession(phone);
+            await clearPersistedQuoteSession(phone);
+          }
 
           const trackingMsg =
             `\n\n🔍 *Rastreo de tu pedido en tiempo real:*\n` +
@@ -1614,9 +1693,9 @@ async function handleCustomerBuffer(phone, messages) {
         pendingQuote.updatedAt = Date.now();
         await persistQuoteSession(phone, pendingQuote);
 
-        // Elegir A/B/C/D ya confirma la alternativa comercial. Si los
-        // insumos llegaron antes, se crea el pedido de inmediato; si faltan,
-        // se solicitan y el siguiente mensaje útil continuará el flujo.
+        // Elegir A/B/C/D confirma la alternativa comercial. Si los insumos
+        // llegaron antes se pasa directo a solicitar el abono, pero NO se crea
+        // el pedido hasta validar el comprobante.
         if (pendingQuote.assets.length > 0) {
           parsedData = selectedQuoteData(pendingQuote);
           confirmedFromQuote = true;
@@ -1661,6 +1740,18 @@ async function handleCustomerBuffer(phone, messages) {
 
   if (!parsedData && !hasNonTextInput && isExplicitOrderConfirmation(currentText)) {
     await sendFreshQuoteReminder(phone);
+    await markBufferProcessed(bufferIds);
+    return;
+  }
+
+  // Con la alternativa seleccionada y los insumos completos, el siguiente
+  // paso es el pago. No se reserva un NG ni se registra nada en el panel aquí.
+  if (confirmedFromQuote && pendingQuote) {
+    pendingQuote.awaitingDesignInputs = false;
+    pendingQuote.awaitingPayment = true;
+    pendingQuote.updatedAt = Date.now();
+    await persistQuoteSession(phone, pendingQuote);
+    await sendQuotePaymentRequest(phone, pendingQuote);
     await markBufferProcessed(bufferIds);
     return;
   }
@@ -1732,8 +1823,9 @@ async function handleCustomerBuffer(phone, messages) {
       return;
     }
 
-    // Solo una aceptación explícita puede crear factura y pedido.
-    console.log(`📦 [PEDIDO CONFIRMADO] ${phone} confirmó ${parsedData.productos.length} producto(s), Total estimado: $${totalAmount}. Registrando...`);
+    // Solo una aceptación explícita inicia la solicitud de pago. El pedido
+    // real, ID, factura y carpeta se generan después del comprobante válido.
+    console.log(`💳 [COTIZACIÓN LISTA PARA PAGO] ${phone} confirmó ${parsedData.productos.length} producto(s), Total estimado: $${totalAmount}.`);
 
     let newInvoiceId = null;
     if (totalAmount > 0) {
