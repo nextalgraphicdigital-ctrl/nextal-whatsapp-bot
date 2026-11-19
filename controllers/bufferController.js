@@ -184,7 +184,7 @@ async function sendPendingOrderPackage(phone, order) {
  */
 async function uploadDesignAssetsForOrder(order, assets) {
   const designAssets = (assets || []).filter(asset =>
-    ['image', 'document'].includes(asset.message_type) &&
+    ['image', 'document', 'audio', 'video'].includes(asset.message_type) &&
     typeof asset.media_url === 'string' && asset.media_url.startsWith('data:')
   );
   if (!designAssets.length) return [];
@@ -201,7 +201,7 @@ async function uploadDesignAssetsForOrder(order, assets) {
   const uploaded = [];
   for (const [index, asset] of designAssets.entries()) {
     const mime = asset.media_url.match(/^data:([^;]+);base64,/i)?.[1] || '';
-    const extension = mime.includes('png') ? 'png' : mime.includes('pdf') ? 'pdf' : mime.includes('webp') ? 'webp' : 'jpg';
+    const extension = mime.includes('png') ? 'png' : mime.includes('pdf') ? 'pdf' : mime.includes('webp') ? 'webp' : mime.includes('ogg') ? 'ogg' : mime.includes('mpeg') || mime.includes('mp3') ? 'mp3' : mime.includes('mp4') ? 'mp4' : 'jpg';
     const fileName = `${order.id}_insumo_${Date.now()}_${index + 1}.${extension}`;
     const storageUrl = await uploadBase64ToSupabaseStorage(order.id, fileName, asset.media_url);
     const driveFileUrl = await uploadBase64ToFolder(folderId, fileName, asset.media_url);
@@ -515,7 +515,7 @@ function quoteProducts(data) {
 }
 
 function isDesignAsset(message) {
-  return ['image', 'document'].includes(message?.message_type) &&
+  return ['image', 'document', 'audio', 'video'].includes(message?.message_type) &&
     typeof message?.media_url === 'string' &&
     message.media_url.startsWith('data:');
 }
@@ -995,7 +995,7 @@ async function handleCustomerBuffer(phone, messages) {
     // nuevo después de una ronda de cambios.
     const currentTextForIntent = getCurrentTextMessages(messages);
     const hasNonTextInputForIntent = messages.some(message =>
-      ['image', 'document', 'audio'].includes(message.message_type)
+      ['image', 'document', 'audio', 'video'].includes(message.message_type)
     );
     const explicitlyMentionedOrder = findMentionedActiveOrder(currentTextForIntent, activeOrders);
     let replyLinkedOrder = null;
@@ -1484,7 +1484,7 @@ async function handleCustomerBuffer(phone, messages) {
       ? null
       : activeOrder;
     const hasCreativeAttachments = messages.some(message =>
-      ['image', 'document', 'audio'].includes(message.message_type)
+      ['image', 'document', 'audio', 'video'].includes(message.message_type)
     );
     const looksLikeOrderFollowUp = hasCreativeAttachments ||
       /\b(cambi|ajust|modific|correg|referenc|logo|imagen|foto|archivo|audio|aprueb|avance)\b/i.test(currentTextForIntent);
@@ -1526,7 +1526,7 @@ async function handleCustomerBuffer(phone, messages) {
             } catch (revErr) {}
 
             // 2. Si el cliente adjuntó imágenes o bocetos nuevos para el cambio, subirlos a Drive
-            const newChangeAssets = messages.filter(m => (m.message_type === 'image' || m.message_type === 'document') && m.media_url && m.media_url.startsWith('data:'));
+            const newChangeAssets = messages.filter(m => ['image', 'document', 'audio', 'video'].includes(m.message_type) && m.media_url && m.media_url.startsWith('data:'));
             if (newChangeAssets.length > 0) {
               await uploadDesignAssetsForOrder(targetOrderForFeedback, newChangeAssets);
             }
@@ -1623,7 +1623,7 @@ async function handleCustomerBuffer(phone, messages) {
       // Si no es una instrucción textual de ajuste, los adjuntos restantes son
       // insumos creativos. Los comprobantes válidos ya retornaron antes de llegar aquí.
       const designAssets = messages.filter(m =>
-        ['image', 'document'].includes(m.message_type) &&
+        ['image', 'document', 'audio', 'video'].includes(m.message_type) &&
         typeof m.media_url === 'string' && m.media_url.startsWith('data:')
       );
       if (designAssets.length > 0) {
@@ -1685,7 +1685,7 @@ async function handleCustomerBuffer(phone, messages) {
     // del modelo cuando el cliente solo está comprobando que el canal funciona.
     const currentText = getCurrentTextMessages(messages);
     const hasNonTextInput = messages.some(message =>
-      ['image', 'document', 'audio'].includes(message.message_type)
+      ['image', 'document', 'audio', 'video'].includes(message.message_type)
     );
     // Un comprobante previo no es un insumo del diseño nuevo. De este modo no
     // se adjunta por error al pedido que el cliente acaba de solicitar.
@@ -2248,7 +2248,7 @@ async function activateOrderAfterPayment({ order, paymentAnalysis, clientPhones,
          FROM whatsapp_inbound_buffer
          WHERE id = ANY($1::bigint[])
            AND (
-             (message_type IN ('image', 'document') AND media_url IS NOT NULL AND media_url != '')
+             (message_type IN ('image', 'document', 'audio', 'video') AND media_url IS NOT NULL AND media_url != '')
              OR (content IS NOT NULL AND content ~* 'https?://')
            )
          ORDER BY created_at ASC`,
@@ -2300,7 +2300,8 @@ async function activateOrderAfterPayment({ order, paymentAnalysis, clientPhones,
           const mimeToExt = {
             'image/jpeg': 'jpg', 'image/png': 'png', 'image/gif': 'gif',
             'image/webp': 'webp', 'application/pdf': 'pdf',
-            'application/zip': 'zip'
+            'application/zip': 'zip', 'audio/ogg': 'ogg', 'audio/mpeg': 'mp3',
+            'audio/mp4': 'm4a', 'video/mp4': 'mp4'
           };
           ext = mimeToExt[mimeHint] || (asset.message_type === 'document' ? 'pdf' : 'jpg');
         }
