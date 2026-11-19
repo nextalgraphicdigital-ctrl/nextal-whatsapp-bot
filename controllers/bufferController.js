@@ -3,7 +3,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { query } from '../config/db.js';
 import { transcribeAudio } from '../services/whisperService.js';
-import { extractOrderDetails, validatePaymentReceipt, detectFeedbackOrAdjustment, assignDesignAssetsToProducts, extractDesignReferenceBrief } from '../services/geminiService.js';
+import { extractOrderDetails, validatePaymentReceipt, detectFeedbackOrAdjustment, decideConversationFlow, assignDesignAssetsToProducts, extractDesignReferenceBrief } from '../services/geminiService.js';
 import { createOrderFolder, getFolderIdFromUrl, uploadBase64ToFolder, getFinalDeliverables, renameOrderFolder } from '../services/driveService.js';
 import { sendWhatsAppWithDelay } from '../services/whatsappTransport.js';
 import { getActiveBotRulesContext, notifyNewOrderBatch, requestHumanIntervention, resolveHumanIntervention } from '../services/telegramControlService.js';
@@ -1003,7 +1003,27 @@ async function handleCustomerBuffer(phone, messages) {
       Number.isInteger(activeQuoteSession.selectedOptionIndex) ||
       quoteProducts(activeQuoteSession.data).length > 0
     ));
-    const isNewRequest = isNewCommercialRequest(currentTextForIntent);
+    // La IA solo enruta la conversación; las operaciones sensibles continúan
+    // protegidas por las validaciones estrictas del controlador.
+    let flowDecision = { intent: 'ambiguo', confidence: 0, orderId: null, reason: '' };
+    try {
+      flowDecision = await decideConversationFlow({
+        message: currentTextForIntent,
+        hasAttachments: hasNonTextInputForIntent,
+        activeOrders,
+        quoteState: activeQuoteSession
+          ? (activeQuoteSession.awaitingPayment ? 'esperando comprobante' : activeQuoteSession.awaitingDesignInputs ? 'esperando insumos' : 'cotización activa')
+          : 'ninguna'
+      });
+      console.log(`🧠 [DECISIÓN IA] ${phone}: ${flowDecision.intent} (${flowDecision.confidence}) ${flowDecision.reason || ''}`);
+    } catch (error) {
+      console.warn('⚠️ [DECISIÓN IA] Se usará el flujo seguro por reglas:', error.message);
+    }
+    const aiSaysNewRequest = flowDecision.intent === 'nuevo_pedido' && flowDecision.confidence >= 0.78;
+    const aiLinkedOrder = flowDecision.confidence >= 0.82 && flowDecision.orderId
+      ? activeOrders.find(order => order.id === flowDecision.orderId) || null
+      : null;
+    const isNewRequest = isNewCommercialRequest(currentTextForIntent) || aiSaysNewRequest;
     const startsNewCommercialFlow = isGreetingOnly(currentTextForIntent) || isNewRequest;
     // Un saludo o una cotización nueva tiene prioridad total sobre pedidos
     // anteriores. También cierra cualquier aclaración pendiente de una
@@ -1018,7 +1038,8 @@ async function handleCustomerBuffer(phone, messages) {
     }
     if (explicitlyMentionedOrder) activeOrder = explicitlyMentionedOrder;
     else if (replyLinkedOrder) activeOrder = replyLinkedOrder;
-    const hasResolvedOrderReference = Boolean(explicitlyMentionedOrder || replyLinkedOrder);
+    else if (!isNewRequest && aiLinkedOrder) activeOrder = aiLinkedOrder;
+    const hasResolvedOrderReference = Boolean(explicitlyMentionedOrder || replyLinkedOrder || (!isNewRequest && aiLinkedOrder));
 
     // Un saludo aislado nunca se interpreta como cambio, pago ni como un
     // archivo pendiente de otro pedido: se responde y se termina este lote.

@@ -580,3 +580,53 @@ DEVUELVE ÚNICAMENTE UN JSON VÁLIDO CON ESTA ESTRUCTURA EXACTA (sin bloques de 
 
   return { isFeedback: false, type: 'otro', resumen: '' };
 }
+
+/** Capa de criterio: clasifica la conversación, pero nunca ejecuta pagos ni crea pedidos. */
+export async function decideConversationFlow({ message, hasAttachments = false, activeOrders = [], quoteState = '' } = {}) {
+  const cleanMessage = String(message || '').trim();
+  if (!cleanMessage && !hasAttachments) return { intent: 'otro', confidence: 1, orderId: null, reason: '' };
+  const apiKey = getGeminiApiKey();
+  if (!apiKey) return { intent: 'ambiguo', confidence: 0, orderId: null, reason: 'Sin clave de IA' };
+
+  const ordersContext = (activeOrders || []).slice(0, 5).map(order =>
+    '- ' + order.id + ': ' + (order.tipoDiseno || 'Diseño') + '; estado ' + (order.estado || 'sin estado') + '; notas ' + (order.notes || '').slice(0, 140)
+  ).join('\n') || 'No hay pedidos activos.';
+  const ai = new GoogleGenAI({ apiKey });
+  const prompt = [
+    'Eres el enrutador inteligente de WhatsApp de Nextal Graphic. Determina la intención del ÚLTIMO mensaje sin inventar información.',
+    '',
+    'INTENCIONES: nuevo_pedido, insumos_cotizacion, comprobante_pago, cambio_pedido, aprobacion_diseno, consulta_avance, saludo, ambiguo.',
+    'Si habla de otro/nuevo/necesito/cotiza seguido de un producto o diseño, es nuevo_pedido y NO un cambio.',
+    'Si adjunta recursos y hay cotización abierta, es insumos_cotizacion. Solo devuelve un orderId cuando sea inequívoco; ante duda usa null.',
+    'Nunca decidas pagos, montos, IDs ni creación de pedidos.',
+    '',
+    'PEDIDOS ACTIVOS:', ordersContext,
+    'ESTADO DE COTIZACIÓN ABIERTA: ' + (quoteState || 'ninguno'),
+    'TIENE ADJUNTOS: ' + (hasAttachments ? 'sí' : 'no'),
+    'ÚLTIMO MENSAJE: ' + (cleanMessage || '[solo adjuntos]'),
+    '',
+    'Devuelve solamente JSON válido:',
+    '{"intent":"nuevo_pedido|insumos_cotizacion|comprobante_pago|cambio_pedido|aprobacion_diseno|consulta_avance|saludo|ambiguo","confidence":0.0,"orderId":"NG-0000 o null","reason":"resumen corto"}'
+  ].join('\n');
+
+  const models = ['gemini-3.5-flash-lite', 'gemini-3.5-flash', 'gemini-flash-lite-latest'];
+  for (const model of models) {
+    try {
+      const response = await callGeminiWithRetry(() => ai.models.generateContent({
+        model, contents: prompt, config: { temperature: 0, responseMimeType: 'application/json' }
+      }), 1, 1000);
+      if (!response?.text) continue;
+      const parsed = JSON.parse(response.text.replace(/```json/g, '').replace(/```/g, '').trim());
+      const allowed = new Set(['nuevo_pedido', 'insumos_cotizacion', 'comprobante_pago', 'cambio_pedido', 'aprobacion_diseno', 'consulta_avance', 'saludo', 'ambiguo']);
+      return {
+        intent: allowed.has(parsed.intent) ? parsed.intent : 'ambiguo',
+        confidence: Math.max(0, Math.min(1, Number(parsed.confidence) || 0)),
+        orderId: typeof parsed.orderId === 'string' && /^NG-\d+$/i.test(parsed.orderId) ? parsed.orderId.toUpperCase() : null,
+        reason: String(parsed.reason || '').slice(0, 240)
+      };
+    } catch (error) {
+      console.warn('⚠️ [DECISIÓN IA] ' + model + ' no respondió: ' + error.message);
+    }
+  }
+  return { intent: 'ambiguo', confidence: 0, orderId: null, reason: 'IA no disponible' };
+}
