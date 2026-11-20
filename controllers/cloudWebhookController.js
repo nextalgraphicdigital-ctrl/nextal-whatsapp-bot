@@ -34,23 +34,24 @@ function messageContent(message) {
 
 async function mediaDataUri(message) {
   const media = message?.[message.type];
-  if (!media?.id || !['image', 'audio', 'document'].includes(message.type)) return null;
+  if (!media?.id || !['image', 'audio', 'document', 'video'].includes(message.type)) return null;
   const { contentType, buffer } = await downloadCloudMedia(media.id);
   return `data:${contentType};base64,${buffer.toString('base64')}`;
 }
 
-async function storeInboundMessage(message) {
+async function storeInboundMessage(message, profileName = '') {
   const phone = String(message.from || '').replace(/\D/g, '');
   if (!phone || !message.id) return;
   await ensureOrderMessageSchema();
+  await query(`ALTER TABLE whatsapp_inbound_buffer ADD COLUMN IF NOT EXISTS profile_name TEXT`);
   const type = ['image', 'audio', 'document', 'video'].includes(message.type) ? message.type : 'text';
   let mediaUrl = null;
   try { mediaUrl = await mediaDataUri(message); } catch (error) { console.warn(`⚠️ [Cloud API] No se descargó el archivo entrante: ${error.message}`); }
   await query(
-    `INSERT INTO whatsapp_inbound_buffer (phone_number, message_type, content, media_url, processed, msg_id, reply_to_msg_id, created_at)
-     SELECT $1, $2, $3, $4, false, $5, $6, NOW()
+    `INSERT INTO whatsapp_inbound_buffer (phone_number, message_type, content, media_url, processed, msg_id, reply_to_msg_id, profile_name, created_at)
+     SELECT $1, $2, $3, $4, false, $5, $6, $7, NOW()
      WHERE NOT EXISTS (SELECT 1 FROM whatsapp_inbound_buffer WHERE msg_id = $5 AND msg_id IS NOT NULL)`,
-    [phone, type, messageContent(message), mediaUrl, message.id, message.context?.id || null]
+    [phone, type, messageContent(message), mediaUrl, message.id, message.context?.id || null, profileName || null]
   );
   console.log(`📩 [Cloud API] Mensaje entrante de ${phone} (${type}) guardado.`);
 }
@@ -64,7 +65,11 @@ export async function receiveCloudWebhook(req, res) {
   try {
     for (const entry of req.body?.entry || []) {
       for (const change of entry.changes || []) {
-        for (const message of change.value?.messages || []) await storeInboundMessage(message);
+        const contacts = change.value?.contacts || [];
+        for (const message of change.value?.messages || []) {
+          const contact = contacts.find(item => String(item.wa_id || '') === String(message.from || ''));
+          await storeInboundMessage(message, contact?.profile?.name || '');
+        }
       }
     }
   } catch (error) {

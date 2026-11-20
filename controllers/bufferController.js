@@ -3,7 +3,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { query } from '../config/db.js';
 import { transcribeAudio } from '../services/whisperService.js';
-import { extractOrderDetails, validatePaymentReceipt, detectFeedbackOrAdjustment, decideConversationFlow, assignDesignAssetsToProducts, extractDesignReferenceBrief } from '../services/geminiService.js';
+import { extractOrderDetails, validatePaymentReceipt, detectFeedbackOrAdjustment, decideConversationFlow, assignDesignAssetsToProducts } from '../services/geminiService.js';
 import { createOrderFolder, getFolderIdFromUrl, uploadBase64ToFolder, getFinalDeliverables, renameOrderFolder } from '../services/driveService.js';
 import { sendWhatsAppWithDelay } from '../services/whatsappTransport.js';
 import { getActiveBotRulesContext, notifyNewOrderBatch, requestHumanIntervention, resolveHumanIntervention } from '../services/telegramControlService.js';
@@ -133,7 +133,9 @@ async function ensureFinancialColumns() {
         ADD COLUMN IF NOT EXISTS valor_base NUMERIC,
         ADD COLUMN IF NOT EXISTS costo_cambios NUMERIC NOT NULL DEFAULT 0,
         ADD COLUMN IF NOT EXISTS cambios_cliente INTEGER NOT NULL DEFAULT 0,
-        ADD COLUMN IF NOT EXISTS entrega_enviada_at TIMESTAMPTZ
+        ADD COLUMN IF NOT EXISTS entrega_enviada_at TIMESTAMPTZ,
+        ADD COLUMN IF NOT EXISTS medida_ancho NUMERIC,
+        ADD COLUMN IF NOT EXISTS medida_alto NUMERIC
     `).catch(error => {
       financialColumnsReady = null;
       throw error;
@@ -146,6 +148,33 @@ function getOrderDescription(order) {
   const notes = String(order?.notes || '').trim();
   const match = notes.match(/(?:📝\s*Notas:|descripci[oó]n:)\s*([\s\S]*?)(?:\n📁|$)/i);
   return (match?.[1] || notes || 'Sin especificaciones adicionales').trim();
+}
+
+function isUsableClientName(value) {
+  const name = String(value || '').trim();
+  return Boolean(name) && !/^(cliente\s*whatsapp|cliente|persona\s*natural|desconocido)$/i.test(name);
+}
+
+function resolveClientName(parsedName, registeredName, profileName) {
+  if (isUsableClientName(parsedName)) return String(parsedName).trim();
+  if (isUsableClientName(registeredName)) return String(registeredName).trim();
+  if (isUsableClientName(profileName)) return String(profileName).trim();
+  return 'Cliente WhatsApp';
+}
+
+// El panel usa centímetros. Convierte medidas explícitas del cliente a cm y
+// deja vacíos los campos cuando no se indicó una dimensión real.
+function extractMeasures(product) {
+  const text = String(product?.medidas || '');
+  const match = text.match(/(\d+(?:[.,]\d+)?)\s*(mm|cm|m)?\s*(?:x|×|por)\s*(\d+(?:[.,]\d+)?)\s*(mm|cm|m)?/i);
+  if (!match) return { width: null, height: null };
+  const toCm = (raw, unit) => {
+    const value = Number(String(raw).replace(',', '.'));
+    if (!Number.isFinite(value)) return null;
+    const normalized = String(unit || 'cm').toLowerCase();
+    return normalized === 'm' ? value * 100 : normalized === 'mm' ? value / 10 : value;
+  };
+  return { width: toCm(match[1], match[2]), height: toCm(match[3], match[4] || match[2]) };
 }
 
 /** Envía el mismo paquete comercial para pedidos nuevos y pedidos pendientes. */
@@ -986,6 +1015,9 @@ async function handleCustomerBuffer(phone, messages) {
 
     // Reconstruir texto consolidado con contexto del historial
     const combinedText = await buildCombinedText(messages, historyMessages);
+    const whatsappProfileName = [...messages, ...historyMessages]
+      .map(message => message?.profile_name)
+      .find(isUsableClientName) || '';
 
     // Identificar todas las imágenes adjuntas en este lote de mensajes
     const imageMessages = messages.filter((m) => m.message_type === 'image' && m.media_url);
@@ -1286,7 +1318,8 @@ async function handleCustomerBuffer(phone, messages) {
 
           const prodPrincipal = (parsedData?.productos && parsedData.productos[0]) || {};
           const tipoDisenoPrincipal = (parsedData?.productos || []).map(p => p.tipoDiseno).join(', ') || 'Diseño Gráfico';
-          const clientName = parsedData?.nombreCliente || registeredClient?.name || 'Cliente WhatsApp';
+          const clientName = resolveClientName(parsedData?.nombreCliente, registeredClient?.name, whatsappProfileName);
+          const measures = extractMeasures(prodPrincipal);
 
           // 1. Crear subcarpeta en Google Drive para el pedido
           let driveUrl = null;
@@ -1315,15 +1348,10 @@ async function handleCustomerBuffer(phone, messages) {
           }
 
           const quoteAssetsForOrder = quoteAwaitingPayment?.assets || [];
-          const referenceBrief = quoteAssetsForOrder.length
-            ? await extractDesignReferenceBrief(quoteAssetsForOrder)
-            : '';
           const notasStr = prodPrincipal.notasDiseno || prodPrincipal.descripcionDetallada || 'Sin notas adicionales';
-          // `notes` se muestra al cliente en Rastreo: solo conserva instrucciones creativas.
-          const orderNotes = [
-            notasStr,
-            referenceBrief ? `Insumos y referencias visuales:\n${referenceBrief}` : ''
-          ].filter(Boolean).join('\n\n');
+          // Solo instrucciones expresadas por el cliente; los archivos ya
+          // quedan en Drive y no se convierten en una descripción inventada.
+          const orderNotes = notasStr;
 
           const costoDisenadorNum = Math.round(valorNum * 0.4);
           const utilidadNum = valorNum - costoDisenadorNum;
@@ -1334,13 +1362,13 @@ async function handleCustomerBuffer(phone, messages) {
               valor, abono, saldo, "metodoPago", estado, qc_status, referencia, drive_url, "driveFolderId", "driveFolderUrl",
               "archivosEnviados", notes, origen, whatsapp_chat_id, created_at,
               "costoDisenador", "costoAsesor", utilidad, "pagoCliente", "pagoDisenador", "pagoAsesor",
-              comprobante_url, "confRecepcion"
+              comprobante_url, "confRecepcion", medida_ancho, medida_alto
             ) VALUES (
               $1, $2, $3, $4, $5, $6, $7, 'WhatsApp Bot', $8,
               $9, $10, $11, $12, 'Abonado', 'pendiente_diseno', $13, $14, $15, $14,
               FALSE, $16, 'whatsapp', $17, NOW(),
               $18, 0, $19, $20, 'Pendiente', 'Pendiente',
-              $21, 'Confirmado'
+              $21, 'Confirmado', $22, $23
             )`,
             [
               orderId,
@@ -1363,7 +1391,9 @@ async function handleCustomerBuffer(phone, messages) {
               costoDisenadorNum,
               utilidadNum,
               pagoClienteEstado,
-              receiptUrl
+              receiptUrl,
+              measures.width,
+              measures.height
             ]
           );
 
@@ -1886,12 +1916,11 @@ async function handleCustomerBuffer(phone, messages) {
       incomingDesignAssets
     );
     const assetAssignments = await assignDesignAssetsToProducts(parsedData.productos, pendingAssets);
-    const referenceBrief = await extractDesignReferenceBrief(pendingAssets);
 
     for (const [productIndex, prod] of parsedData.productos.entries()) {
       const orderId = await getNextSynchronizedOrderId();
 
-      const clientName = parsedData.nombreCliente || registeredClient?.name || 'Cliente WhatsApp';
+      const clientName = resolveClientName(parsedData.nombreCliente, registeredClient?.name, whatsappProfileName);
 
       // 1. Crear subcarpeta automáticamente en Google Drive dentro de 'Diseños - Nextal Graphic'
       let driveUrl = null;
@@ -1976,8 +2005,7 @@ async function handleCustomerBuffer(phone, messages) {
       // NOTAS LIMPIAS DEL PEDIDO (Sin el chat de WhatsApp ni voleo de texto)
       const notasStr = [
         prod.notasDiseno,
-        prod.descripcionDetallada,
-        referenceBrief ? `Insumos y referencias visuales:\n${referenceBrief}` : ''
+        prod.descripcionDetallada
       ].filter((value, index, all) => value && all.indexOf(value) === index).join('\n\n') || 'Sin especificaciones adicionales';
       // Rastreo consume este campo directamente; nunca mezclar enlaces, pagos o medidas.
       const orderNotes = notasStr;
@@ -2421,6 +2449,8 @@ export async function syncOrderToSupabase(orderId) {
       telefono: row.telefono,
       canal: row.canal || 'WhatsApp',
       tipoDiseno: row.tipoDiseno,
+      medida_ancho: row.medida_ancho != null ? Number(row.medida_ancho) : null,
+      medida_alto: row.medida_alto != null ? Number(row.medida_alto) : null,
       estado: row.estado,
       qc_status: row.qc_status || 'pendiente_diseno',
       referencia: row.referencia,
