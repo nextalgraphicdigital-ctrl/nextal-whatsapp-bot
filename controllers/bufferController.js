@@ -1083,6 +1083,15 @@ async function handleCustomerBuffer(phone, messages) {
     // reiniciado entre la cotización y el envío de los insumos.
     await restoreQuoteSession(phone);
     const activeQuoteSession = getQuoteSession(phone);
+    // Una letra A/B/C/D pertenece a una cotización abierta. Se detecta antes
+    // de consultar a la IA o aplicar reglas de saludo: jamás puede reiniciar
+    // la conversación ni quedar escondida detrás de un mensaje anterior.
+    const selectedQuoteOptionNow = Boolean(
+      activeQuoteSession &&
+      isAlternativeQuote(activeQuoteSession.data) &&
+      !Number.isInteger(activeQuoteSession.selectedOptionIndex) &&
+      findSelectedOptionIndex(currentTextForIntent, quoteProducts(activeQuoteSession.data).length) !== null
+    );
     // Una cotización que espera comprobante siempre tiene prioridad sobre
     // pedidos anteriores del mismo número: el pago debe crear ESTA solicitud.
     const quoteAwaitingPayment = activeQuoteSession?.awaitingPayment ? activeQuoteSession : null;
@@ -1112,7 +1121,9 @@ async function handleCustomerBuffer(phone, messages) {
       ? activeOrders.find(order => order.id === flowDecision.orderId) || null
       : null;
     const isNewRequest = isNewCommercialRequest(currentTextForIntent) || aiSaysNewRequest;
-    const startsNewCommercialFlow = isGreetingOnly(currentTextForIntent) || isNewRequest;
+    const startsNewCommercialFlow = !selectedQuoteOptionNow && (
+      isNewRequest || (!activeQuoteSession && isGreetingOnly(currentTextForIntent))
+    );
     // Un saludo o una cotización nueva tiene prioridad total sobre pedidos
     // anteriores. También cierra cualquier aclaración pendiente de una
     // conversación vieja para que no escale por error al equipo humano.
@@ -1131,7 +1142,7 @@ async function handleCustomerBuffer(phone, messages) {
 
     // Un saludo aislado nunca se interpreta como cambio, pago ni como un
     // archivo pendiente de otro pedido: se responde y se termina este lote.
-    if (!hasNonTextInputForIntent && isGreetingOnly(currentTextForIntent)) {
+    if (!hasNonTextInputForIntent && !activeQuoteSession && isGreetingOnly(currentTextForIntent)) {
       await sendWhatsAppWithDelay(
         phone,
         '¡Hola! 👋 Bienvenido a Nextal Graphic, tu aliado creativo del sector publicitario.\n¿En qué podemos ayudarte hoy?'
@@ -1768,7 +1779,7 @@ async function handleCustomerBuffer(phone, messages) {
     const rememberedDesignAssets = incomingDesignAssets.length > 0
       ? rememberQuoteAssets(phone, incomingDesignAssets)
       : getRememberedQuoteAssets(phone);
-    if (!hasNonTextInput && isGreetingOnly(currentText)) {
+    if (!hasNonTextInput && !pendingQuote && isGreetingOnly(currentText)) {
       console.log(`💬 [BUFFER] Saludo aislado de ${phone}; respondiendo sin crear pedido.`);
       await sendWhatsAppWithDelay(
         phone,
