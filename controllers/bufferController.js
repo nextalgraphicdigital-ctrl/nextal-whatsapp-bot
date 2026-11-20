@@ -125,6 +125,49 @@ async function getNextSynchronizedOrderId() {
   return `${ORDER_ID_PREFIX}${String(next).padStart(4, '0')}`;
 }
 
+/**
+ * El panel es la fuente de verdad para pedidos visibles. Si el administrador
+ * elimina un pedido allí, el bot no puede seguir usándolo como contexto ni
+ * pedirle al cliente que lo seleccione desde una copia antigua en Neon.
+ */
+async function discardOrdersRemovedFromPanel(orders) {
+  const candidates = Array.isArray(orders) ? orders.filter(order => order?.id) : [];
+  if (!candidates.length) return [];
+  const supabaseUrl = process.env.SUPABASE_URL || 'https://ygpfvmevizoetnvsxsqu.supabase.co';
+  const supabaseKey = process.env.SUPABASE_ANON_KEY || 'sb_publishable_f3fibrFoyyjwmAQ1rX1X-Q_UVS3nQtm';
+  const ids = candidates.map(order => String(order.id));
+  try {
+    const filter = `in.(${ids.map(id => `"${id.replace(/"/g, '')}"`).join(',')})`;
+    const response = await fetch(
+      `${supabaseUrl}/rest/v1/orders?select=id,estado&id=${encodeURIComponent(filter)}`,
+      { headers: { apikey: supabaseKey, Authorization: `Bearer ${supabaseKey}` } }
+    );
+    if (!response.ok) throw new Error(`Supabase respondió ${response.status}`);
+    const remoteOrders = await response.json();
+    const valid = new Set((Array.isArray(remoteOrders) ? remoteOrders : [])
+      .filter(order => !['cancelado', 'anulado', 'eliminado'].includes(String(order?.estado || '').toLowerCase()))
+      .map(order => String(order.id)));
+    const removedIds = ids.filter(id => !valid.has(id));
+    if (removedIds.length) {
+      try {
+        await query(
+          `UPDATE orders SET estado = 'Cancelado', qc_status = 'eliminado_panel', updated_at = NOW() WHERE id = ANY($1::text[])`,
+          [removedIds]
+        );
+      } catch (error) {
+        console.warn('⚠️ No se pudo marcar la copia local como eliminada:', error.message);
+      }
+      console.log(`🧹 [SINCRONIZACIÓN] Pedidos eliminados del panel ignorados: ${removedIds.join(', ')}`);
+    }
+    return candidates.filter(order => valid.has(String(order.id)));
+  } catch (error) {
+    // Si el panel está momentáneamente fuera de línea no se borra ni se
+    // inventa contexto; se conserva la última información válida del bot.
+    console.warn('⚠️ No se pudo validar pedidos contra el panel:', error.message);
+    return candidates;
+  }
+}
+
 /** Campos separados para conservar el valor original y sumar ajustes sin ambigüedad. */
 async function ensureFinancialColumns() {
   if (!financialColumnsReady) {
@@ -979,7 +1022,7 @@ async function handleCustomerBuffer(phone, messages) {
        ORDER BY created_at DESC LIMIT 5`,
       [clientPhones]
     );
-    const activeOrders = activeOrdersRes.rows || [];
+    const activeOrders = await discardOrdersRemovedFromPanel(activeOrdersRes.rows || []);
     let activeOrder = activeOrders[0] || null;
     const activeOrdersContext = activeOrders
       .map(o => `- Pedido [${o.id}]: ${o.tipoDiseno} | Estado: ${o.estado} | Valor: $${Number(o.valor).toLocaleString('es-CO')}`)
