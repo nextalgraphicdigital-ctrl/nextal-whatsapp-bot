@@ -786,6 +786,32 @@ async function restoreQuoteSession(phone) {
   }
 }
 
+/**
+ * WhatsApp puede entregar el mismo chat con número, JID o LID en mensajes
+ * distintos. La cotización debe sobrevivir a ese cambio de identificador.
+ */
+async function restoreQuoteSessionForClient(phone, linkedPhones = []) {
+  const identifiers = [...new Set([phone, ...(Array.isArray(linkedPhones) ? linkedPhones : [])]
+    .map(value => String(value || '').trim())
+    .filter(Boolean))];
+
+  for (const identifier of identifiers) {
+    await restoreQuoteSession(identifier);
+    const session = getQuoteSession(identifier);
+    if (!session) continue;
+
+    // Conserva la misma referencia bajo el identificador de este mensaje para
+    // que el resto del flujo (A/B/C/D, insumos y comprobante) use un solo estado.
+    getQuoteSessionKeys(phone).forEach(key => quoteSessions.set(key, session));
+    getQuoteSessionKeys(phone).forEach(key => quoteAssets.set(key, {
+      assets: session.assets || [],
+      updatedAt: session.updatedAt
+    }));
+    return session;
+  }
+  return null;
+}
+
 async function clearPersistedQuoteSession(phone) {
   try {
     await ensureQuoteSessionSchema();
@@ -1081,7 +1107,7 @@ async function handleCustomerBuffer(phone, messages) {
     }
     // Recupera el punto exacto del flujo aunque el proceso del bot se haya
     // reiniciado entre la cotización y el envío de los insumos.
-    await restoreQuoteSession(phone);
+    await restoreQuoteSessionForClient(phone, clientPhones);
     const activeQuoteSession = getQuoteSession(phone);
     // Una letra A/B/C/D pertenece a una cotización abierta. Se detecta antes
     // de consultar a la IA o aplicar reglas de saludo: jamás puede reiniciar
