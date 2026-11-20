@@ -1779,7 +1779,9 @@ async function handleCustomerBuffer(phone, messages) {
     const rememberedDesignAssets = incomingDesignAssets.length > 0
       ? rememberQuoteAssets(phone, incomingDesignAssets)
       : getRememberedQuoteAssets(phone);
-    if (!hasNonTextInput && !pendingQuote && isGreetingOnly(currentText)) {
+    // Se consulta aquí, porque pendingQuote se inicializa más abajo al entrar
+    // en la etapa de cotización. No uses esa variable antes de declararla.
+    if (!hasNonTextInput && !getQuoteSession(phone) && isGreetingOnly(currentText)) {
       console.log(`💬 [BUFFER] Saludo aislado de ${phone}; respondiendo sin crear pedido.`);
       await sendWhatsAppWithDelay(
         phone,
