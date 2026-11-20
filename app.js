@@ -62,12 +62,16 @@ const httpServer = app.listen(PORT, async () => {
     } else {
       await initBaileys();
     }
-    await startTelegramControl();
-
     console.log('🔄 Iniciando motor de Debounce / Búfer (Evaluación cada 3 segundos)...');
     setInterval(async () => {
       await processInboundBuffers();
     }, 3000);
+
+    // Telegram es auxiliar. Nunca debe detener la atención de WhatsApp si
+    // tarda, falla o no tiene conectividad al iniciar.
+    startTelegramControl().catch(error => {
+      console.warn('⚠️ [Telegram] No se pudo iniciar; WhatsApp continúa activo:', error.message);
+    });
 
   } catch (error) {
     console.error('❌ Error al iniciar el transporte de WhatsApp:', error.message);
