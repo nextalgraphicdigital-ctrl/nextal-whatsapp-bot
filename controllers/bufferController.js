@@ -1795,6 +1795,20 @@ async function handleCustomerBuffer(phone, messages) {
   let confirmedFromQuote = false;
   const pendingQuote = getQuoteSession(phone);
 
+  // Una vez enviados el resumen y las cuentas, esta cotización queda cerrada
+  // para nuevos análisis hasta recibir el comprobante. Un texto extraído de
+  // una imagen, audio o un mensaje rezagado no puede abrir una segunda
+  // cotización. Solo se permite salir de aquí si el cliente pide de forma
+  // explícita OTRO/NUEVO diseño por texto.
+  const explicitAdditionalQuote = !hasNonTextInput &&
+    isNewCommercialRequest(currentText) &&
+    /\b(otro|nueva|nuevo|adicional|aparte|tambien)\b/.test(normalizeFlowText(currentText));
+  if (pendingQuote?.awaitingPayment && !validReceiptMessage && !explicitAdditionalQuote) {
+    console.log(`⏳ [COTIZACIÓN] ${phone} espera comprobante; se ignora contenido rezagado sin crear otra cotización.`);
+    await markBufferProcessed(bufferIds);
+    return;
+  }
+
   // Una cotización queda asociada solo a esta conversación durante 45 minutos.
   // Así un "Confirmo el pedido" no crea un pedido viejo o inventado.
   if (pendingQuote) {
