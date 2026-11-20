@@ -737,6 +737,17 @@ async function persistQuoteSession(phone, session) {
   }
 }
 
+/** Guarda la cotización bajo cada alias conocido: número, JID y LID. */
+async function persistQuoteSessionForClient(phone, linkedPhones = [], session) {
+  const identifiers = [...new Set([phone, ...(Array.isArray(linkedPhones) ? linkedPhones : [])]
+    .map(value => String(value || '').trim())
+    .filter(Boolean))];
+  await Promise.all(identifiers.map(async identifier => {
+    getQuoteSessionKeys(identifier).forEach(key => quoteSessions.set(key, session));
+    await persistQuoteSession(identifier, session);
+  }));
+}
+
 async function restoreQuoteSession(phone) {
   if (getQuoteSession(phone)) return;
   try {
@@ -1851,7 +1862,7 @@ async function handleCustomerBuffer(phone, messages) {
           incomingDesignAssets
         );
         pendingQuote.updatedAt = Date.now();
-        await persistQuoteSession(phone, pendingQuote);
+        await persistQuoteSessionForClient(phone, clientPhones, pendingQuote);
 
         // Elegir A/B/C/D confirma la alternativa comercial. Si los insumos
         // llegaron antes se pasa directo a solicitar el abono, pero NO se crea
@@ -1910,7 +1921,7 @@ async function handleCustomerBuffer(phone, messages) {
     pendingQuote.awaitingDesignInputs = false;
     pendingQuote.awaitingPayment = true;
     pendingQuote.updatedAt = Date.now();
-    await persistQuoteSession(phone, pendingQuote);
+    await persistQuoteSessionForClient(phone, clientPhones, pendingQuote);
     await sendQuotePaymentRequest(phone, pendingQuote);
     await markBufferProcessed(bufferIds);
     return;
@@ -1976,7 +1987,7 @@ async function handleCustomerBuffer(phone, messages) {
     // posterior recupere estos mismos productos sin que el cliente repita todo.
   if (!confirmedFromQuote) {
     const savedQuoteSession = saveQuoteSession(phone, parsedData, rememberedDesignAssets);
-    await persistQuoteSession(phone, savedQuoteSession);
+    await persistQuoteSessionForClient(phone, clientPhones, savedQuoteSession);
       console.log(`💬 [COTIZACIÓN] ${phone} consultó ${parsedData.productos.length} producto(s) sin confirmar pedido.`);
       await sendQuoteOnly(phone, parsedData);
       await markBufferProcessed(bufferIds);
